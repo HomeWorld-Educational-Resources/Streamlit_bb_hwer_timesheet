@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Jiaman",
+    "company_project": "BaoBunny Creatives",
+    "default_rate": 200,
+    "max_contract_spend": 10000,
+    "notes": "will apply for NIW when estimated successful rate over 80%"
+  },
+  {
+    "name": "Abinay",
+    "company_project": "BaoBunny Creatives",
+    "default_rate": 200,
+    "max_contract_spend": 10000,
+    "notes": "will apply for NIW when estimated successful rate over 80%"
+  }
+]

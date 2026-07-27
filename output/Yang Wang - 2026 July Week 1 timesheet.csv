@@ -1,0 +1,29 @@
+﻿TIMESHEET REPORT
+Generated,2026-07-01 22:44
+
+CUSTOMER INFO
+Customer,Yang Wang
+Company / Project,NIW-12mon
+Week Starting,2026-06-29
+Week Number,1
+Hourly Rate,$200.00
+Prior Balance,$0.00
+Max Contract Spend,$10000.00
+Contract Note,"Aiming at 06-01-2027, NIW"
+Footnote,Dr. Ali Salman as external expert on this project
+
+ACTIVITIES
+Activity,Mon,Tue,Wed,Thu,Fri,Total Hours,Output Description
+"Timesheet setup, Strategy version 1 creation, project installation",,2.0,,,,2.0,"Timesheet, Strategy, Project Teammembers"
+"Meeting, External Expert, Ali Salman",,,,,1.0,1.0,Setup External Expert Dr. Salman
+Project Launch Meeting,,,,,1.0,1.0,Get stakeholders on the same page
+,,,,,,,
+,,,,,,,
+
+WEEK SUMMARY
+Total Hours,4.0
+Hourly Rate,$200.00
+Amount This Week,$800.00
+Prior Balance,$0.00
+Total Due,$800.00
+

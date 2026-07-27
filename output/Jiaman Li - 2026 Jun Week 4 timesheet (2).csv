@@ -1,0 +1,43 @@
+﻿TIMESHEET REPORT
+Generated,2026-07-01 23:22
+
+CUSTOMER INFO
+Customer,Jiaman Li
+Company / Project,NIW+EB1
+Week Starting,2026-06-22
+Week Number,4
+Hourly Rate,$200.00
+Prior Balance,$1140.00
+Max Contract Spend,$10000.00
+Contract Note,Aiming at Early 2027 for NIW application
+Footnote,"Date for Payment (every 1st of each month, $200 per mon, until balance is fully paid))"
+
+ACTIVITIES
+Activity,Mon,Tue,Wed,Thu,Fri,Total Hours,Output Description
+July Follow Up,,,,1.0,,1.0,"Confirmed Papers, potential wildfire, ABM and power infrastructure testimonial letters, confirmed judge jobs, and awards, later book chapter and program"
+,,,,,,,
+,,,,,,,
+,,,,,,,
+,,,,,,,
+
+WEEK SUMMARY
+Total Hours,1.0
+Hourly Rate,$200.00
+Amount This Week,$200.00
+Prior Balance,$1140.00
+Total Due,$0.00
+
+PAYMENT HISTORY
+Amount,Payment Date,Notes
+$600.00,Dec-10-2025,Inital Payment
+$500.00,Jan-26-2026,
+$200.00,Mar-03-2026,no activities in Jan
+$200.00,Apr-01-2026,
+$200.00,May-03-2026,
+$200.00,Jun-01-2026,
+
+BALANCE SUMMARY
+Total Paid,$1900.00
+Amount This Week,$200.00
+Prior Balance,$1140.00
+Outstanding,$0.00
