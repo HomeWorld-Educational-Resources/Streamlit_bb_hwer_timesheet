@@ -18,6 +18,32 @@ N_ACTIVITY_ROWS = 5
 MAX_PAYMENT_ROWS = 30
 
 st.set_page_config(page_title='Customer Timesheet Builder', layout='wide')
+
+# ── password gate ─────────────────────────────────────────────────────────────
+
+def _check_password():
+    """Show a password prompt and block the rest of the app until it's correct."""
+
+    def _password_entered():
+        if st.session_state.get('_pw_input') == st.secrets.get('app_password'):
+            st.session_state['_authenticated'] = True
+            del st.session_state['_pw_input']
+        else:
+            st.session_state['_authenticated'] = False
+
+    if st.session_state.get('_authenticated'):
+        return True
+
+    st.title('Customer Timesheet Builder')
+    st.text_input('Password', type='password', on_change=_password_entered, key='_pw_input')
+    if st.session_state.get('_authenticated') is False:
+        st.error('Incorrect password.')
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 db.init_db()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
