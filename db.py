@@ -1,5 +1,6 @@
 import json
 from contextlib import contextmanager
+from datetime import date, datetime
 
 import psycopg2
 import psycopg2.extras
@@ -9,6 +10,19 @@ import streamlit as st
 # and never commit secrets.toml to git. See .streamlit/secrets.toml:
 #   db_url = "postgresql://user:password@host:port/dbname"
 DB_URL = st.secrets["db_url"]
+
+
+def _row(r):
+    """Convert a DB row to a plain dict, stringifying datetime/date values
+    so callers get the same str-like values SQLite used to return
+    (e.g. ts['created_at'][:10] keeps working)."""
+    d = dict(r)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+        elif isinstance(v, date):
+            d[k] = v.strftime('%Y-%m-%d')
+    return d
 
 
 @contextmanager
@@ -76,7 +90,7 @@ def all_customers():
     with _db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM customers ORDER BY LOWER(name)")
-        return [dict(r) for r in cur.fetchall()]
+        return [_row(r) for r in cur.fetchall()]
 
 
 def customer_by_name(name):
@@ -84,7 +98,7 @@ def customer_by_name(name):
         cur = conn.cursor()
         cur.execute("SELECT * FROM customers WHERE LOWER(name) = LOWER(%s)", (name,))
         r = cur.fetchone()
-        return dict(r) if r else None
+        return _row(r) if r else None
 
 
 def upsert_customer(name, company_project='', default_rate=None,
@@ -127,7 +141,7 @@ def get_payments(customer_id):
             "SELECT * FROM payments WHERE customer_id=%s ORDER BY sort_order, id",
             (customer_id,)
         )
-        return [dict(r) for r in cur.fetchall()]
+        return [_row(r) for r in cur.fetchall()]
 
 
 def replace_payments(customer_id, payments):
@@ -172,7 +186,7 @@ def list_timesheets(customer_id):
             FROM timesheets WHERE customer_id=%s
             ORDER BY week_start DESC, created_at DESC
         """, (customer_id,))
-        return [dict(r) for r in cur.fetchall()]
+        return [_row(r) for r in cur.fetchall()]
 
 
 def get_timesheet(ts_id):
@@ -182,7 +196,7 @@ def get_timesheet(ts_id):
         r = cur.fetchone()
         if not r:
             return None
-        d = dict(r)
+        d = _row(r)
         d['activities'] = json.loads(d.pop('activities_json', '[]'))
         d['payments_snapshot'] = json.loads(d.pop('payments_snapshot_json', '[]'))
         return d
