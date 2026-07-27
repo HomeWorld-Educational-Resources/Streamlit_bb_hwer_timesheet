@@ -1,16 +1,19 @@
 import json
-import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / 'timesheet.db'
+import psycopg2
+import psycopg2.extras
+import streamlit as st
+
+# Connection string comes from Streamlit secrets — never hardcode it here,
+# and never commit secrets.toml to git. See .streamlit/secrets.toml:
+#   db_url = "postgresql://user:password@host:port/dbname"
+DB_URL = st.secrets["db_url"]
 
 
 @contextmanager
 def _db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
@@ -23,30 +26,34 @@ def _db():
 
 def init_db():
     with _db() as conn:
-        conn.executescript("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS customers (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                id                 SERIAL PRIMARY KEY,
                 name               TEXT    NOT NULL,
                 company_project    TEXT    DEFAULT '',
                 default_rate       REAL,
                 max_contract_spend REAL,
                 contract_note      TEXT    DEFAULT '',
                 footnote           TEXT    DEFAULT '',
-                created_at         TEXT    DEFAULT (datetime('now')),
-                updated_at         TEXT    DEFAULT (datetime('now')),
-                UNIQUE(name COLLATE NOCASE)
+                created_at         TIMESTAMP DEFAULT NOW(),
+                updated_at         TIMESTAMP DEFAULT NOW()
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS customers_name_lower_idx
+                ON customers (LOWER(name));
+
             CREATE TABLE IF NOT EXISTS payments (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                id           SERIAL PRIMARY KEY,
                 customer_id  INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
                 sort_order   INTEGER DEFAULT 0,
                 amount       REAL,
                 payment_date TEXT    DEFAULT '',
                 notes        TEXT    DEFAULT '',
-                created_at   TEXT    DEFAULT (datetime('now'))
+                created_at   TIMESTAMP DEFAULT NOW()
             );
+
             CREATE TABLE IF NOT EXISTS timesheets (
-                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id                          SERIAL PRIMARY KEY,
                 customer_id                 INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
                 week_start                  TEXT    NOT NULL,
                 week_number                 INTEGER DEFAULT 0,
@@ -58,7 +65,7 @@ def init_db():
                 activities_json             TEXT    DEFAULT '[]',
                 payments_snapshot_json      TEXT    DEFAULT '[]',
                 file_name                   TEXT    DEFAULT '',
-                created_at                  TEXT    DEFAULT (datetime('now'))
+                created_at                  TIMESTAMP DEFAULT NOW()
             );
         """)
 
@@ -67,66 +74,71 @@ def init_db():
 
 def all_customers():
     with _db() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM customers ORDER BY name COLLATE NOCASE"
-        ).fetchall()]
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM customers ORDER BY LOWER(name)")
+        return [dict(r) for r in cur.fetchall()]
 
 
 def customer_by_name(name):
     with _db() as conn:
-        r = conn.execute(
-            "SELECT * FROM customers WHERE name = ? COLLATE NOCASE", (name,)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM customers WHERE LOWER(name) = LOWER(%s)", (name,))
+        r = cur.fetchone()
         return dict(r) if r else None
 
 
 def upsert_customer(name, company_project='', default_rate=None,
                     max_contract_spend=None, contract_note='', footnote=''):
     with _db() as conn:
-        existing = conn.execute(
-            "SELECT id FROM customers WHERE name = ? COLLATE NOCASE", (name,)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM customers WHERE LOWER(name) = LOWER(%s)", (name,))
+        existing = cur.fetchone()
         if existing:
-            conn.execute("""
+            cur.execute("""
                 UPDATE customers
-                SET company_project=?, default_rate=?, max_contract_spend=?,
-                    contract_note=?, footnote=?, updated_at=datetime('now')
-                WHERE id=?
+                SET company_project=%s, default_rate=%s, max_contract_spend=%s,
+                    contract_note=%s, footnote=%s, updated_at=NOW()
+                WHERE id=%s
             """, (company_project, default_rate, max_contract_spend,
                   contract_note, footnote, existing['id']))
             return existing['id']
-        cur = conn.execute("""
+        cur.execute("""
             INSERT INTO customers
                 (name, company_project, default_rate, max_contract_spend, contract_note, footnote)
-            VALUES (?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            RETURNING id
         """, (name, company_project, default_rate, max_contract_spend,
               contract_note, footnote))
-        return cur.lastrowid
+        return cur.fetchone()['id']
 
 
 def delete_customer(cid):
     with _db() as conn:
-        conn.execute("DELETE FROM customers WHERE id=?", (cid,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM customers WHERE id=%s", (cid,))
 
 
 # ── payments ──────────────────────────────────────────────────────────────────
 
 def get_payments(customer_id):
     with _db() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM payments WHERE customer_id=? ORDER BY sort_order, id",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM payments WHERE customer_id=%s ORDER BY sort_order, id",
             (customer_id,)
-        ).fetchall()]
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def replace_payments(customer_id, payments):
     """Replace all payments for a customer. payments = list of {amount, payment_date, notes}."""
     with _db() as conn:
-        conn.execute("DELETE FROM payments WHERE customer_id=?", (customer_id,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM payments WHERE customer_id=%s", (customer_id,))
         for i, p in enumerate(payments):
-            conn.execute("""
+            cur.execute("""
                 INSERT INTO payments (customer_id, sort_order, amount, payment_date, notes)
-                VALUES (?,?,?,?,?)
+                VALUES (%s,%s,%s,%s,%s)
             """, (customer_id, i,
                   p.get('amount'), p.get('payment_date', ''), p.get('notes', '')))
 
@@ -138,30 +150,36 @@ def save_timesheet(customer_id, week_start, week_number, hourly_rate,
                    contract_note, footnote, activities, payments_snapshot,
                    file_name):
     with _db() as conn:
-        cur = conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             INSERT INTO timesheets
                 (customer_id, week_start, week_number, hourly_rate, prior_balance,
                  max_contract_spend_override, contract_note, footnote,
                  activities_json, payments_snapshot_json, file_name)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
         """, (customer_id, week_start, week_number, hourly_rate, prior_balance,
               max_contract_spend_override, contract_note, footnote,
               json.dumps(activities), json.dumps(payments_snapshot), file_name))
-        return cur.lastrowid
+        return cur.fetchone()['id']
 
 
 def list_timesheets(customer_id):
     with _db() as conn:
-        return [dict(r) for r in conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             SELECT id, week_start, week_number, hourly_rate, file_name, created_at
-            FROM timesheets WHERE customer_id=?
+            FROM timesheets WHERE customer_id=%s
             ORDER BY week_start DESC, created_at DESC
-        """, (customer_id,)).fetchall()]
+        """, (customer_id,))
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_timesheet(ts_id):
     with _db() as conn:
-        r = conn.execute("SELECT * FROM timesheets WHERE id=?", (ts_id,)).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM timesheets WHERE id=%s", (ts_id,))
+        r = cur.fetchone()
         if not r:
             return None
         d = dict(r)
@@ -172,8 +190,10 @@ def get_timesheet(ts_id):
 
 def last_timesheet_activities(customer_id):
     with _db() as conn:
-        r = conn.execute("""
-            SELECT activities_json FROM timesheets WHERE customer_id=?
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT activities_json FROM timesheets WHERE customer_id=%s
             ORDER BY created_at DESC LIMIT 1
-        """, (customer_id,)).fetchone()
+        """, (customer_id,))
+        r = cur.fetchone()
         return json.loads(r['activities_json']) if r else []
