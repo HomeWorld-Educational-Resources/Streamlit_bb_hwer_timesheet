@@ -380,9 +380,9 @@ def generate_pdf(customer_name, company, week_dt, week_number,
 
     # ── week summary ──────────────────────────────────────────────────────────
     amount_week = total_hours * rate
-    total_paid_global = sum(_sf(p.get('amount')) for p in payments
-                            if _sf(p.get('amount'), None) is not None)
-    total_due = max(0.0, prior_bal + amount_week - total_paid_global)
+    # Prior Balance is already net of all payments received to date, so it is
+    # not subtracted again here — doing so would double-count payments.
+    total_due = max(0.0, prior_bal + amount_week)
 
     d.section_label('Week Summary', pad_above=16)
     _summary_boxes(d, [
