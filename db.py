@@ -81,6 +81,18 @@ def init_db():
                 file_name                   TEXT    DEFAULT '',
                 created_at                  TIMESTAMP DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS milestones (
+                id               SERIAL PRIMARY KEY,
+                customer_id      INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                sort_order       INTEGER DEFAULT 0,
+                title            TEXT    NOT NULL,
+                target_date      TEXT    DEFAULT '',
+                percent_complete REAL    DEFAULT 0,
+                status           TEXT    DEFAULT 'Not Started',
+                notes            TEXT    DEFAULT '',
+                created_at       TIMESTAMP DEFAULT NOW()
+            );
         """)
 
 
@@ -211,3 +223,31 @@ def last_timesheet_activities(customer_id):
         """, (customer_id,))
         r = cur.fetchone()
         return json.loads(r['activities_json']) if r else []
+
+
+# ── milestones ────────────────────────────────────────────────────────────────
+
+def get_milestones(customer_id):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM milestones WHERE customer_id=%s ORDER BY sort_order, id",
+            (customer_id,)
+        )
+        return [_row(r) for r in cur.fetchall()]
+
+
+def replace_milestones(customer_id, milestones):
+    """Replace all milestones for a customer.
+    milestones = list of {title, target_date, percent_complete, status, notes}."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM milestones WHERE customer_id=%s", (customer_id,))
+        for i, m in enumerate(milestones):
+            cur.execute("""
+                INSERT INTO milestones
+                    (customer_id, sort_order, title, target_date, percent_complete, status, notes)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (customer_id, i, m.get('title', ''), m.get('target_date', ''),
+                  m.get('percent_complete', 0), m.get('status', 'Not Started'),
+                  m.get('notes', '')))

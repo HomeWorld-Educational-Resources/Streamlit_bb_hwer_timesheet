@@ -16,6 +16,8 @@ PAYMENT_DATE_FORMAT = '%b-%d-%Y'
 WEEK_DATE_FORMAT = '%Y-%m-%d'
 N_ACTIVITY_ROWS = 5
 MAX_PAYMENT_ROWS = 30
+MAX_MILESTONE_ROWS = 20
+MILESTONE_STATUSES = ['Not Started', 'In Progress', 'Complete', 'Blocked']
 
 st.set_page_config(page_title='Customer Timesheet Builder', layout='wide')
 
@@ -106,6 +108,13 @@ def _blank_pmts():
     ])
 
 
+def _blank_milestones():
+    return pd.DataFrame([
+        {'Milestone': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''}
+        for _ in range(MAX_MILESTONE_ROWS)
+    ])
+
+
 def _acts_from_db(customer_id):
     rows = db.last_timesheet_activities(customer_id)
     result = []
@@ -135,6 +144,23 @@ def _pmts_from_db(customer_id):
     return pd.DataFrame(result[:MAX_PAYMENT_ROWS])
 
 
+def _milestones_from_db(customer_id):
+    rows = db.get_milestones(customer_id)
+    result = [
+        {
+            'Milestone': m['title'] or '',
+            'Target Date': m['target_date'] or '',
+            '% Complete': m['percent_complete'] or 0,
+            'Status': m['status'] or 'Not Started',
+            'Notes': m['notes'] or '',
+        }
+        for m in rows
+    ]
+    while len(result) < MAX_MILESTONE_ROWS:
+        result.append({'Milestone': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''})
+    return pd.DataFrame(result[:MAX_MILESTONE_ROWS])
+
+
 # ── CSV builder (used for generation and history re-download) ─────────────────
 
 def _build_csv(customer_name, company, week_dt, week_number,
@@ -148,7 +174,9 @@ def _build_csv(customer_name, company, week_dt, week_number,
                       + _hours(a.get('thu')) + _hours(a.get('fri')) for a in activities)
     amount_week = total_hours * (rate or 0.0)
     total_paid = sum(_sf(p.get('amount'), 0.0) for p in payments if _sf(p.get('amount')) is not None)
-    total_due = max(0.0, (prior_bal or 0.0) + amount_week - total_paid)
+    # Prior Balance is already net of all payments received to date, so it is
+    # not subtracted again here — doing so would double-count payments.
+    total_due = max(0.0, (prior_bal or 0.0) + amount_week)
 
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -229,6 +257,7 @@ def _select_customer(cust):
     ss.week_prior_bal = '0'
     ss.activities_df = _acts_from_db(cust['id'])
     ss.payments_df = _pmts_from_db(cust['id'])
+    ss.milestones_df = _milestones_from_db(cust['id'])
     ss.editor_v += 1
     ss.generated_bytes = None
     ss.generated_name = None
@@ -250,6 +279,7 @@ def _clear_for_new():
     ss.week_prior_bal = '0'
     ss.activities_df = _blank_acts()
     ss.payments_df = _blank_pmts()
+    ss.milestones_df = _blank_milestones()
     ss.editor_v += 1
     ss.generated_bytes = None
     ss.generated_name = None
@@ -272,6 +302,7 @@ def _init():
     ss.generated_pdf_name = None
     ss.activities_df = _blank_acts()
     ss.payments_df = _blank_pmts()
+    ss.milestones_df = _blank_milestones()
     # customer form widget keys
     ss.cust_name = ''
     ss.cust_company = ''
@@ -348,6 +379,33 @@ def _do_save_payments(payments_df):
     ss.payments_df = _pmts_from_db(ss.customer_id)
     ss.editor_v += 1
     ss.status = f'Saved {len(rows)} payment record(s).'
+    ss.status_type = 'success'
+
+
+def _do_save_milestones(milestones_df):
+    ss = st.session_state
+    if not ss.customer_id:
+        ss.status = 'Error: Save customer first before saving milestones.'
+        ss.status_type = 'error'
+        return
+    rows = []
+    for _, r in milestones_df.iterrows():
+        title = str(r.get('Milestone', '')).strip()
+        if not title:
+            continue
+        pct = _sf(r.get('% Complete'), 0.0) or 0.0
+        pct = max(0.0, min(100.0, pct))
+        rows.append({
+            'title': title,
+            'target_date': str(r.get('Target Date', '')).strip(),
+            'percent_complete': pct,
+            'status': str(r.get('Status', '') or 'Not Started').strip(),
+            'notes': str(r.get('Notes', '')).strip(),
+        })
+    db.replace_milestones(ss.customer_id, rows)
+    ss.milestones_df = _milestones_from_db(ss.customer_id)
+    ss.editor_v += 1
+    ss.status = f'Saved {len(rows)} milestone(s).'
     ss.status_type = 'success'
 
 
@@ -525,7 +583,9 @@ with st.sidebar:
 
 
 # ── Main: tabs ────────────────────────────────────────────────────────────────
-tab_sheet, tab_payments, tab_history = st.tabs(['New Timesheet', 'Payments', 'History'])
+tab_sheet, tab_payments, tab_milestones, tab_history = st.tabs(
+    ['New Timesheet', 'Payments', 'Milestones', 'History']
+)
 
 # ── Tab 1: New Timesheet ──────────────────────────────────────────────────────
 with tab_sheet:
@@ -614,7 +674,76 @@ with tab_payments:
         _do_save_payments(payments_df)
         st.rerun()
 
-# ── Tab 3: History ────────────────────────────────────────────────────────────
+# ── Tab: Milestones ────────────────────────────────────────────────────────────
+with tab_milestones:
+    if not ss.customer_id:
+        st.info('Select or create a customer to track milestones.')
+    else:
+        st.subheader(f'Milestone Progress — {ss.cust_name}')
+        st.caption('Track project milestones, target dates, and completion status for this customer.')
+
+        milestones_df = st.data_editor(
+            ss.milestones_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows='dynamic',
+            column_config={
+                'Milestone': st.column_config.TextColumn('Milestone', width='medium'),
+                'Target Date': st.column_config.TextColumn('Target Date (e.g. Jan-26-2026)', width='medium'),
+                '% Complete': st.column_config.NumberColumn('% Complete', min_value=0, max_value=100, step=5, width='small'),
+                'Status': st.column_config.SelectboxColumn('Status', options=MILESTONE_STATUSES, width='small'),
+                'Notes': st.column_config.TextColumn('Notes', width='large'),
+            },
+            key=f'milestones_editor_{ss.editor_v}',
+        )
+
+        if st.button('Save Milestones', type='primary'):
+            _do_save_milestones(milestones_df)
+            st.rerun()
+
+        st.divider()
+
+        saved = db.get_milestones(ss.customer_id)
+        active = [m for m in saved if (m.get('title') or '').strip()]
+
+        if not active:
+            st.info('No milestones saved yet — add rows above and click Save Milestones.')
+        else:
+            overall = sum(m.get('percent_complete', 0) or 0 for m in active) / len(active)
+            done = sum(1 for m in active if (m.get('status') or '') == 'Complete')
+
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric('Overall Progress', f'{overall:.0f}%')
+            mc2.metric('Milestones Complete', f'{done} / {len(active)}')
+            mc3.metric('In Progress', sum(1 for m in active if (m.get('status') or '') == 'In Progress'))
+
+            st.subheader('Progress Table')
+            progress_view = pd.DataFrame([{
+                'Milestone': m['title'],
+                'Target Date': m.get('target_date', ''),
+                'Status': m.get('status', ''),
+                'Progress': (m.get('percent_complete', 0) or 0) / 100.0,
+            } for m in active])
+
+            st.dataframe(
+                progress_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'Progress': st.column_config.ProgressColumn(
+                        'Progress', min_value=0, max_value=1, format='%.0f%%'
+                    ),
+                },
+            )
+
+            st.subheader('Progress by Milestone')
+            chart_df = pd.DataFrame({
+                m['title']: [m.get('percent_complete', 0) or 0] for m in active
+            }).T
+            chart_df.columns = ['% Complete']
+            st.bar_chart(chart_df, horizontal=True, height=max(200, 40 * len(active)))
+
+# ── Tab: History ────────────────────────────────────────────────────────────
 with tab_history:
     customer_label = ss.cust_name or 'No customer selected'
     st.subheader(f'Timesheet History — {customer_label}')
