@@ -93,6 +93,29 @@ def init_db():
                 notes            TEXT    DEFAULT '',
                 created_at       TIMESTAMP DEFAULT NOW()
             );
+            ALTER TABLE milestones ADD COLUMN IF NOT EXISTS category TEXT DEFAULT '';
+
+            CREATE TABLE IF NOT EXISTS contractors (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT    NOT NULL,
+                email      TEXT    DEFAULT '',
+                notes      TEXT    DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS contractors_name_lower_idx
+                ON contractors (LOWER(name));
+            ALTER TABLE contractors ADD COLUMN IF NOT EXISTS hourly_rate REAL;
+
+            CREATE TABLE IF NOT EXISTS contractor_entries (
+                id            SERIAL PRIMARY KEY,
+                contractor_id INTEGER NOT NULL REFERENCES contractors(id) ON DELETE CASCADE,
+                customer_id   INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+                sort_order    INTEGER DEFAULT 0,
+                entry_date    TEXT    DEFAULT '',
+                hours         REAL    DEFAULT 0,
+                description   TEXT    DEFAULT '',
+                created_at    TIMESTAMP DEFAULT NOW()
+            );
         """)
 
 
@@ -239,15 +262,117 @@ def get_milestones(customer_id):
 
 def replace_milestones(customer_id, milestones):
     """Replace all milestones for a customer.
-    milestones = list of {title, target_date, percent_complete, status, notes}."""
+    milestones = list of {title, target_date, percent_complete, status, notes, category}."""
     with _db() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM milestones WHERE customer_id=%s", (customer_id,))
         for i, m in enumerate(milestones):
             cur.execute("""
                 INSERT INTO milestones
-                    (customer_id, sort_order, title, target_date, percent_complete, status, notes)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    (customer_id, sort_order, title, target_date, percent_complete, status, notes, category)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """, (customer_id, i, m.get('title', ''), m.get('target_date', ''),
                   m.get('percent_complete', 0), m.get('status', 'Not Started'),
-                  m.get('notes', '')))
+                  m.get('notes', ''), m.get('category', '')))
+
+
+# ── contractors ───────────────────────────────────────────────────────────────
+
+def all_contractors():
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM contractors ORDER BY LOWER(name)")
+        return [_row(r) for r in cur.fetchall()]
+
+
+def contractor_by_name(name):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM contractors WHERE LOWER(name) = LOWER(%s)", (name,))
+        r = cur.fetchone()
+        return _row(r) if r else None
+
+
+def upsert_contractor(name, email='', notes='', hourly_rate=None):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM contractors WHERE LOWER(name) = LOWER(%s)", (name,))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute("""
+                UPDATE contractors SET email=%s, notes=%s, hourly_rate=%s WHERE id=%s
+            """, (email, notes, hourly_rate, existing['id']))
+            return existing['id']
+        cur.execute("""
+            INSERT INTO contractors (name, email, notes, hourly_rate)
+            VALUES (%s,%s,%s,%s)
+            RETURNING id
+        """, (name, email, notes, hourly_rate))
+        return cur.fetchone()['id']
+
+
+def delete_contractor(cid):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM contractors WHERE id=%s", (cid,))
+
+
+# ── contractor entries ───────────────────────────────────────────────────────
+
+def get_contractor_entries(contractor_id):
+    """Returns entries for a contractor, joined with the customer name they served."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ce.*, c.name AS customer_name
+            FROM contractor_entries ce
+            LEFT JOIN customers c ON c.id = ce.customer_id
+            WHERE ce.contractor_id=%s
+            ORDER BY ce.sort_order, ce.id
+        """, (contractor_id,))
+        return [_row(r) for r in cur.fetchall()]
+
+
+def replace_contractor_entries(contractor_id, entries):
+    """Replace all entries for a contractor.
+    entries = list of {customer_id, entry_date, hours, description}."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM contractor_entries WHERE contractor_id=%s", (contractor_id,))
+        for i, e in enumerate(entries):
+            cur.execute("""
+                INSERT INTO contractor_entries
+                    (contractor_id, customer_id, sort_order, entry_date, hours, description)
+                VALUES (%s,%s,%s,%s,%s,%s)
+            """, (contractor_id, e.get('customer_id'), i,
+                  e.get('entry_date', ''), e.get('hours', 0), e.get('description', '')))
+
+
+def entries_for_customer(customer_id):
+    """All contractor entries logged against a given customer, across all contractors."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ce.*, ct.name AS contractor_name
+            FROM contractor_entries ce
+            JOIN contractors ct ON ct.id = ce.contractor_id
+            WHERE ce.customer_id=%s
+            ORDER BY ce.entry_date, ce.id
+        """, (customer_id,))
+        return [_row(r) for r in cur.fetchall()]
+
+
+def all_contractor_entries():
+    """All contractor entries across every contractor, joined with contractor rate
+    and customer name — used for the cross-contractor payment summary."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ce.*, ct.name AS contractor_name, ct.hourly_rate AS contractor_rate,
+                   c.name AS customer_name
+            FROM contractor_entries ce
+            JOIN contractors ct ON ct.id = ce.contractor_id
+            LEFT JOIN customers c ON c.id = ce.customer_id
+            ORDER BY ct.name, ce.entry_date, ce.id
+        """)
+        return [_row(r) for r in cur.fetchall()]

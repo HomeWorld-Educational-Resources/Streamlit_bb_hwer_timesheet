@@ -1,6 +1,6 @@
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +8,7 @@ import streamlit as st
 
 import db
 import pdf_generator
+import ai_estimator
 
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / 'logo.png'
@@ -18,6 +19,26 @@ N_ACTIVITY_ROWS = 5
 MAX_PAYMENT_ROWS = 30
 MAX_MILESTONE_ROWS = 20
 MILESTONE_STATUSES = ['Not Started', 'In Progress', 'Complete', 'Blocked']
+MAX_CONTRACTOR_ENTRY_ROWS = 25
+
+EB1A_CRITERIA = [
+    'EB1A - Awards',
+    'EB1A - Membership',
+    'EB1A - Published Material About You',
+    "EB1A - Judging Others' Work",
+    'EB1A - Original Contributions',
+    'EB1A - Authorship (Scholarly Articles)',
+    'EB1A - Artistic Exhibitions/Showcases',
+    'EB1A - Critical/Leading Role',
+    'EB1A - High Salary',
+    'EB1A - Commercial Success (Arts)',
+]
+NIW_PRONGS = [
+    'NIW Prong 1 - Substantial Merit & National Importance',
+    'NIW Prong 2 - Well Positioned to Advance',
+    'NIW Prong 3 - Beneficial to Waive Job Offer',
+]
+MILESTONE_CATEGORIES = ['—'] + EB1A_CRITERIA + NIW_PRONGS + ['Other']
 
 st.set_page_config(page_title='Customer Timesheet Builder', layout='wide')
 
@@ -89,6 +110,20 @@ def _fmt_pay_date(v):
         return str(v)
 
 
+def _safe_parse_date(v):
+    """Like _parse_date but never raises — returns None if unparseable/blank."""
+    try:
+        return _parse_date(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _current_week_monday():
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    return monday.strftime(WEEK_DATE_FORMAT)
+
+
 def _hours(v):
     f = _sf(v, 0.0)
     return f if f is not None else 0.0
@@ -110,8 +145,15 @@ def _blank_pmts():
 
 def _blank_milestones():
     return pd.DataFrame([
-        {'Milestone': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''}
+        {'Milestone': '', 'Category': '—', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''}
         for _ in range(MAX_MILESTONE_ROWS)
+    ])
+
+
+def _blank_contractor_entries():
+    return pd.DataFrame([
+        {'Date': '', 'Customer': '', 'Hours': '', 'Description': ''}
+        for _ in range(MAX_CONTRACTOR_ENTRY_ROWS)
     ])
 
 
@@ -149,6 +191,7 @@ def _milestones_from_db(customer_id):
     result = [
         {
             'Milestone': m['title'] or '',
+            'Category': m.get('category') or '—',
             'Target Date': m['target_date'] or '',
             '% Complete': m['percent_complete'] or 0,
             'Status': m['status'] or 'Not Started',
@@ -157,8 +200,24 @@ def _milestones_from_db(customer_id):
         for m in rows
     ]
     while len(result) < MAX_MILESTONE_ROWS:
-        result.append({'Milestone': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''})
+        result.append({'Milestone': '', 'Category': '—', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''})
     return pd.DataFrame(result[:MAX_MILESTONE_ROWS])
+
+
+def _contractor_entries_from_db(contractor_id):
+    rows = db.get_contractor_entries(contractor_id)
+    result = [
+        {
+            'Date': e.get('entry_date', '') or '',
+            'Customer': e.get('customer_name', '') or '',
+            'Hours': str(e.get('hours', '') or ''),
+            'Description': e.get('description', '') or '',
+        }
+        for e in rows
+    ]
+    while len(result) < MAX_CONTRACTOR_ENTRY_ROWS:
+        result.append({'Date': '', 'Customer': '', 'Hours': '', 'Description': ''})
+    return pd.DataFrame(result[:MAX_CONTRACTOR_ENTRY_ROWS])
 
 
 # ── CSV builder (used for generation and history re-download) ─────────────────
@@ -241,7 +300,38 @@ def _build_csv(customer_name, company, week_dt, week_number,
     return buf.getvalue().encode('utf-8-sig')  # BOM for Excel compat
 
 
-# ── session state ─────────────────────────────────────────────────────────────
+def _build_contractor_summary_csv(period_label, grouped, grand_hours, grand_amount):
+    """grouped = list of {contractor, rate, rows: [{customer, hours, amount}], total_hours, total_amount}"""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+
+    def row(*cols):
+        w.writerow(cols)
+
+    def blank():
+        w.writerow([])
+
+    row('CONTRACTOR PAYMENT SUMMARY')
+    row('Period', period_label)
+    row('Generated', datetime.now().strftime('%Y-%m-%d %H:%M'))
+    blank()
+
+    for g in grouped:
+        row('CONTRACTOR', g['contractor'])
+        rate = g.get('rate')
+        row('Hourly Rate', f'${rate:,.2f}' if rate else 'Not set')
+        row('Customer', 'Hours', 'Amount')
+        for r in g['rows']:
+            row(r['customer'], f"{r['hours']:g}", f"${r['amount']:,.2f}" if rate else '')
+        row('Subtotal', f"{g['total_hours']:g}", f"${g['total_amount']:,.2f}" if rate else '')
+        blank()
+
+    row('GRAND TOTAL', f'{grand_hours:g}', f'${grand_amount:,.2f}')
+
+    return buf.getvalue().encode('utf-8-sig')  # BOM for Excel compat
+
+
+
 
 def _select_customer(cust):
     ss = st.session_state
@@ -287,6 +377,28 @@ def _clear_for_new():
     ss.generated_pdf_name = None
 
 
+def _select_contractor(contractor):
+    ss = st.session_state
+    ss.contractor_id = contractor['id']
+    ss.contractor_name = contractor['name']
+    ss.contractor_email = str(contractor.get('email') or '')
+    ss.contractor_notes = str(contractor.get('notes') or '')
+    ss.contractor_rate = str(contractor.get('hourly_rate') or '')
+    ss.contractor_entries_df = _contractor_entries_from_db(contractor['id'])
+    ss.editor_v += 1
+
+
+def _clear_for_new_contractor():
+    ss = st.session_state
+    ss.contractor_id = None
+    ss.contractor_name = ''
+    ss.contractor_email = ''
+    ss.contractor_notes = ''
+    ss.contractor_rate = ''
+    ss.contractor_entries_df = _blank_contractor_entries()
+    ss.editor_v += 1
+
+
 def _init():
     ss = st.session_state
     if 'app_init' in ss:
@@ -311,15 +423,27 @@ def _init():
     ss.cust_contract_note = ''
     ss.cust_footnote = ''
     # week form widget keys
-    ss.week_start = ''
-    ss.week_number = ''
+    ss.week_start = _current_week_monday()
+    ss.week_number = 1
     ss.week_rate = ''
     ss.week_prior_bal = '0'
     ss.week_max_override = ''
 
+    # contractor state
+    ss.contractor_id = None
+    ss.contractor_name = ''
+    ss.contractor_email = ''
+    ss.contractor_notes = ''
+    ss.contractor_rate = ''
+    ss.contractor_entries_df = _blank_contractor_entries()
+
     customers = db.all_customers()
     if customers:
         _select_customer(customers[0])
+
+    contractors = db.all_contractors()
+    if contractors:
+        _select_contractor(contractors[0])
 
 
 # ── action functions ──────────────────────────────────────────────────────────
@@ -395,17 +519,75 @@ def _do_save_milestones(milestones_df):
             continue
         pct = _sf(r.get('% Complete'), 0.0) or 0.0
         pct = max(0.0, min(100.0, pct))
+        cat = str(r.get('Category', '') or '—').strip()
         rows.append({
             'title': title,
             'target_date': str(r.get('Target Date', '')).strip(),
             'percent_complete': pct,
             'status': str(r.get('Status', '') or 'Not Started').strip(),
             'notes': str(r.get('Notes', '')).strip(),
+            'category': '' if cat == '—' else cat,
         })
     db.replace_milestones(ss.customer_id, rows)
     ss.milestones_df = _milestones_from_db(ss.customer_id)
     ss.editor_v += 1
     ss.status = f'Saved {len(rows)} milestone(s).'
+    ss.status_type = 'success'
+
+
+def _do_save_contractor():
+    ss = st.session_state
+    name = ss.contractor_name.strip()
+    if not name:
+        ss.status = 'Error: Contractor name is required.'
+        ss.status_type = 'error'
+        return False
+    cid = db.upsert_contractor(name, ss.contractor_email.strip(), ss.contractor_notes.strip(),
+                               _sf(ss.contractor_rate))
+    ss.contractor_id = cid
+    ss.status = f'Contractor "{name}" saved.'
+    ss.status_type = 'success'
+    return True
+
+
+def _do_delete_contractor():
+    ss = st.session_state
+    if not ss.contractor_id:
+        return
+    name = ss.contractor_name
+    db.delete_contractor(ss.contractor_id)
+    _clear_for_new_contractor()
+    contractors = db.all_contractors()
+    if contractors:
+        _select_contractor(contractors[0])
+    ss.status = f'Contractor "{name}" deleted.'
+    ss.status_type = 'info'
+
+
+def _do_save_contractor_entries(entries_df, customer_name_to_id):
+    ss = st.session_state
+    if not ss.contractor_id:
+        ss.status = 'Error: Save contractor first before logging contributions.'
+        ss.status_type = 'error'
+        return
+    rows = []
+    for _, r in entries_df.iterrows():
+        cust_name = str(r.get('Customer', '')).strip()
+        hours = _sf(r.get('Hours'))
+        desc = str(r.get('Description', '')).strip()
+        date_val = str(r.get('Date', '')).strip()
+        if not cust_name and hours is None and not desc and not date_val:
+            continue
+        rows.append({
+            'customer_id': customer_name_to_id.get(cust_name),
+            'entry_date': date_val,
+            'hours': hours or 0.0,
+            'description': desc,
+        })
+    db.replace_contractor_entries(ss.contractor_id, rows)
+    ss.contractor_entries_df = _contractor_entries_from_db(ss.contractor_id)
+    ss.editor_v += 1
+    ss.status = f'Saved {len(rows)} contribution entr{"y" if len(rows) == 1 else "ies"}.'
     ss.status_type = 'success'
 
 
@@ -431,7 +613,7 @@ def _do_generate(activities_df):
     rate = rate or 0.0
     prior_bal = _sf(ss.week_prior_bal) or 0.0
     max_spend = _sf(ss.week_max_override) if ss.week_max_override.strip() else _sf(ss.cust_max_spend)
-    week_num = ss.week_number.strip()
+    week_num = ss.week_number
 
     activities = []
     for _, row in activities_df.iterrows():
@@ -473,7 +655,7 @@ def _do_generate(activities_df):
     db.save_timesheet(
         customer_id=ss.customer_id,
         week_start=week_dt.strftime(WEEK_DATE_FORMAT),
-        week_number=int(week_num) if str(week_num).isdigit() else 0,
+        week_number=int(week_num),
         hourly_rate=rate,
         prior_balance=prior_bal,
         max_contract_spend_override=max_spend,
@@ -583,8 +765,8 @@ with st.sidebar:
 
 
 # ── Main: tabs ────────────────────────────────────────────────────────────────
-tab_sheet, tab_payments, tab_milestones, tab_history = st.tabs(
-    ['New Timesheet', 'Payments', 'Milestones', 'History']
+tab_sheet, tab_payments, tab_milestones, tab_contractors, tab_history = st.tabs(
+    ['New Timesheet', 'Payments', 'Milestones', 'Contractors', 'History']
 )
 
 # ── Tab 1: New Timesheet ──────────────────────────────────────────────────────
@@ -594,7 +776,7 @@ with tab_sheet:
     with wc1:
         st.text_input('Week Start (YYYY-MM-DD)', key='week_start')
     with wc2:
-        st.text_input('Week Number', key='week_number')
+        st.selectbox('Week Number', options=[1, 2, 3, 4], key='week_number')
     with wc3:
         st.text_input('Hourly Rate Override ($)', key='week_rate',
                       help='Leave blank to use customer default rate')
@@ -681,6 +863,7 @@ with tab_milestones:
     else:
         st.subheader(f'Milestone Progress — {ss.cust_name}')
         st.caption('Track project milestones, target dates, and completion status for this customer.')
+        st.caption('Category tags each milestone to an EB1A criterion or NIW prong for the progress charts below.')
 
         milestones_df = st.data_editor(
             ss.milestones_df,
@@ -689,6 +872,7 @@ with tab_milestones:
             num_rows='dynamic',
             column_config={
                 'Milestone': st.column_config.TextColumn('Milestone', width='medium'),
+                'Category': st.column_config.SelectboxColumn('Category', options=MILESTONE_CATEGORIES, width='medium'),
                 'Target Date': st.column_config.TextColumn('Target Date (e.g. Jan-26-2026)', width='medium'),
                 '% Complete': st.column_config.NumberColumn('% Complete', min_value=0, max_value=100, step=5, width='small'),
                 'Status': st.column_config.SelectboxColumn('Status', options=MILESTONE_STATUSES, width='small'),
@@ -720,6 +904,7 @@ with tab_milestones:
             st.subheader('Progress Table')
             progress_view = pd.DataFrame([{
                 'Milestone': m['title'],
+                'Category': m.get('category') or '—',
                 'Target Date': m.get('target_date', ''),
                 'Status': m.get('status', ''),
                 'Progress': (m.get('percent_complete', 0) or 0) / 100.0,
@@ -742,6 +927,274 @@ with tab_milestones:
             }).T
             chart_df.columns = ['% Complete']
             st.bar_chart(chart_df, horizontal=True, height=max(200, 40 * len(active)))
+
+            # ── NIW Prong Progress ───────────────────────────────────────────
+            niw_tagged = [m for m in active if (m.get('category') or '') in NIW_PRONGS]
+            if niw_tagged:
+                st.subheader('NIW Prong Progress')
+                st.caption('Average completion of milestones tagged to each NIW prong.')
+                prong_avgs = {}
+                for prong in NIW_PRONGS:
+                    prong_ms = [m for m in niw_tagged if m.get('category') == prong]
+                    if prong_ms:
+                        prong_avgs[prong] = sum(m.get('percent_complete', 0) or 0 for m in prong_ms) / len(prong_ms)
+                if prong_avgs:
+                    prong_df = pd.DataFrame({'% Complete': prong_avgs})
+                    st.bar_chart(prong_df, horizontal=True, height=max(150, 60 * len(prong_avgs)))
+
+            # ── EB1A Criteria Coverage ───────────────────────────────────────
+            eb1a_tagged = [m for m in active if (m.get('category') or '') in EB1A_CRITERIA]
+            if eb1a_tagged:
+                st.subheader('EB1A Criteria Coverage')
+                st.caption('EB1A petitions generally need evidence across at least 3 of the 10 criteria — average completion shown per criterion with at least one milestone.')
+                crit_avgs = {}
+                for crit in EB1A_CRITERIA:
+                    crit_ms = [m for m in eb1a_tagged if m.get('category') == crit]
+                    if crit_ms:
+                        crit_avgs[crit] = sum(m.get('percent_complete', 0) or 0 for m in crit_ms) / len(crit_ms)
+                if crit_avgs:
+                    st.metric('Criteria Covered', f'{len(crit_avgs)} / 10')
+                    crit_df = pd.DataFrame({'% Complete': crit_avgs})
+                    st.bar_chart(crit_df, horizontal=True, height=max(200, 40 * len(crit_avgs)))
+
+            # ── AI Assessment ─────────────────────────────────────────────────
+            st.subheader('AI Assessment')
+            ai_providers = ai_estimator.available_providers()
+            tagged_categories = sorted(set(
+                m.get('category') for m in active
+                if (m.get('category') or '') in (NIW_PRONGS + EB1A_CRITERIA)
+            ))
+
+            if not ai_providers:
+                st.info(
+                    'No AI provider configured. Add `anthropic_api_key` and/or `openai_api_key` '
+                    'to your Streamlit secrets to enable AI-powered strength/gap assessments '
+                    'per category. See ai_estimator.py for the exact secrets format.'
+                )
+            elif not tagged_categories:
+                st.info('Tag at least one milestone with an EB1A criterion or NIW prong category above to enable AI assessment.')
+            else:
+                st.caption('AI reads the milestones tagged to a category and estimates overall strength, gaps, and next steps. Nothing is auto-applied to your data — review before acting on it.')
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    ai_category = st.selectbox('Category to assess', options=tagged_categories, key='ai_category_select')
+                with ac2:
+                    ai_provider = st.selectbox('AI Provider', options=ai_providers, key='ai_provider_select')
+
+                if st.button('Get AI Assessment'):
+                    cat_milestones = [m for m in active if m.get('category') == ai_category]
+                    with st.spinner(f'Assessing {ai_category} with {ai_provider}...'):
+                        try:
+                            result = ai_estimator.estimate_category(
+                                ai_provider, ai_category, cat_milestones, ss.cust_name
+                            )
+                            ss.ai_assessment_result = result
+                            ss.ai_assessment_category = ai_category
+                            ss.status = 'AI assessment complete.'
+                            ss.status_type = 'success'
+                        except Exception as e:
+                            ss.ai_assessment_result = None
+                            st.error(f'AI assessment failed: {e}')
+
+                if ss.get('ai_assessment_result') and ss.get('ai_assessment_category') == ai_category:
+                    result = ss.ai_assessment_result
+                    st.metric('AI-Estimated Strength', f"{result.get('strength_percent', 0)}%")
+                    st.write(result.get('summary', ''))
+                    gaps = result.get('gaps') or []
+                    suggestions = result.get('suggestions') or []
+                    gcol, scol = st.columns(2)
+                    with gcol:
+                        st.markdown('**Gaps**')
+                        for g in gaps:
+                            st.markdown(f'- {g}')
+                    with scol:
+                        st.markdown('**Suggestions**')
+                        for s in suggestions:
+                            st.markdown(f'- {s}')
+
+# ── Tab: Contractors ─────────────────────────────────────────────────────────
+with tab_contractors:
+    st.subheader('Contractors')
+    st.caption('Manage contractors and log the time they contribute to each customer.')
+
+    contractors = db.all_contractors()
+    contractor_names = [c['name'] for c in contractors]
+    c_options = contractor_names + ['+ New Contractor']
+
+    cc1, cc2 = st.columns([2, 1])
+    with cc1:
+        current_c_sel = (ss.contractor_name if ss.contractor_id and ss.contractor_name in contractor_names
+                         else '+ New Contractor')
+        c_selected = st.selectbox('Contractor', options=c_options, index=c_options.index(current_c_sel))
+
+    if c_selected == '+ New Contractor' and ss.contractor_id is not None:
+        _clear_for_new_contractor()
+        st.rerun()
+    elif c_selected != '+ New Contractor':
+        picked = next((c for c in contractors if c['name'] == c_selected), None)
+        if picked and picked['id'] != ss.contractor_id:
+            _select_contractor(picked)
+            st.rerun()
+
+    with st.expander('Contractor Details', expanded=not ss.contractor_id):
+        st.text_input('Name *', key='contractor_name', placeholder='Contractor full name')
+        st.text_input('Email', key='contractor_email')
+        st.text_input('Hourly Rate ($)', key='contractor_rate')
+        st.text_area('Notes', key='contractor_notes', height=80)
+
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            if st.button('Save Contractor', use_container_width=True, type='primary'):
+                if _do_save_contractor():
+                    st.rerun()
+        with dc2:
+            if ss.contractor_id and st.button('Delete Contractor', use_container_width=True):
+                _do_delete_contractor()
+                st.rerun()
+
+    st.divider()
+
+    if not ss.contractor_id:
+        st.info('Select or create a contractor above to log their contributions.')
+    else:
+        st.subheader(f'Contributions — {ss.contractor_name}')
+        st.caption('Log hours this contractor spent serving each customer.')
+
+        customer_names_list = [c['name'] for c in db.all_customers()]
+        customer_name_to_id = {c['name']: c['id'] for c in db.all_customers()}
+
+        entries_df = st.data_editor(
+            ss.contractor_entries_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows='dynamic',
+            column_config={
+                'Date': st.column_config.TextColumn('Date (e.g. Jan-26-2026)', width='medium'),
+                'Customer': st.column_config.SelectboxColumn('Customer', options=customer_names_list, width='medium'),
+                'Hours': st.column_config.TextColumn('Hours', width='small'),
+                'Description': st.column_config.TextColumn('Description', width='large'),
+            },
+            key=f'contractor_entries_editor_{ss.editor_v}',
+        )
+
+        if st.button('Save Contributions', type='primary'):
+            _do_save_contractor_entries(entries_df, customer_name_to_id)
+            st.rerun()
+
+        st.divider()
+
+        saved_entries = db.get_contractor_entries(ss.contractor_id)
+        active_entries = [e for e in saved_entries if (e.get('description') or e.get('hours'))]
+
+        if not active_entries:
+            st.info('No contributions logged yet — add rows above and click Save Contributions.')
+        else:
+            total_hours = sum(e.get('hours', 0) or 0 for e in active_entries)
+            st.metric('Total Hours Logged', f'{total_hours:g}')
+
+            st.subheader('By Customer')
+            by_customer = {}
+            for e in active_entries:
+                key = e.get('customer_name') or 'Unassigned'
+                by_customer[key] = by_customer.get(key, 0) + (e.get('hours', 0) or 0)
+            hours_chart = pd.DataFrame({'Hours': by_customer})
+            st.bar_chart(hours_chart, horizontal=True, height=max(200, 40 * len(by_customer)))
+
+    st.divider()
+    st.subheader('Payment Summary')
+    st.caption('Filter by date range and see totals owed per contractor, across all contractors.')
+
+    today = datetime.now().date()
+    month_start = today.replace(day=1)
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        range_start = st.date_input('Start Date', value=month_start, key='summary_start_date')
+    with fc2:
+        range_end = st.date_input('End Date', value=today, key='summary_end_date')
+
+    all_entries = db.all_contractor_entries()
+    in_range = []
+    skipped_unparseable = 0
+    for e in all_entries:
+        if not (e.get('description') or e.get('hours')):
+            continue
+        dt = _safe_parse_date(e.get('entry_date'))
+        if dt is None:
+            skipped_unparseable += 1
+            continue
+        if range_start <= dt.date() <= range_end:
+            in_range.append(e)
+
+    if skipped_unparseable:
+        st.caption(f'⚠ {skipped_unparseable} entr{"y" if skipped_unparseable == 1 else "ies"} skipped (unparseable or missing date).')
+
+    if not in_range:
+        st.info('No contractor entries found in this date range.')
+    else:
+        by_contractor = {}
+        for e in in_range:
+            key = e.get('contractor_name') or 'Unknown'
+            by_contractor.setdefault(key, {'rate': e.get('contractor_rate'), 'rows': {}})
+            cust_key = e.get('customer_name') or 'Unassigned'
+            by_contractor[key]['rows'][cust_key] = by_contractor[key]['rows'].get(cust_key, 0) + (e.get('hours', 0) or 0)
+
+        grouped = []
+        grand_hours = 0.0
+        grand_amount = 0.0
+        for contractor_name, info in sorted(by_contractor.items()):
+            rate = info['rate']
+            rows = [{'customer': c, 'hours': h, 'amount': (h * rate) if rate else 0.0}
+                    for c, h in sorted(info['rows'].items())]
+            total_hours = sum(r['hours'] for r in rows)
+            total_amount = sum(r['amount'] for r in rows) if rate else 0.0
+            grouped.append({
+                'contractor': contractor_name,
+                'rate': rate,
+                'rows': rows,
+                'total_hours': total_hours,
+                'total_amount': total_amount,
+            })
+            grand_hours += total_hours
+            grand_amount += total_amount
+
+        sc1, sc2 = st.columns(2)
+        sc1.metric('Total Hours (period)', f'{grand_hours:g}')
+        sc2.metric('Total Amount Owed', f'${grand_amount:,.2f}')
+
+        summary_rows = []
+        for g in grouped:
+            for r in g['rows']:
+                summary_rows.append({
+                    'Contractor': g['contractor'],
+                    'Customer': r['customer'],
+                    'Hours': r['hours'],
+                    'Rate': f"${g['rate']:,.2f}" if g['rate'] else 'Not set',
+                    'Amount': f"${r['amount']:,.2f}" if g['rate'] else '—',
+                })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        period_label = f"{range_start.strftime('%b %d, %Y')} – {range_end.strftime('%b %d, %Y')}"
+        summary_csv = _build_contractor_summary_csv(period_label, grouped, grand_hours, grand_amount)
+        exc1, exc2 = st.columns(2)
+        with exc1:
+            st.download_button(
+                '⬇ CSV', data=summary_csv,
+                file_name=f'contractor_payment_summary_{range_start}_{range_end}.csv',
+                mime='text/csv', use_container_width=True,
+            )
+        with exc2:
+            try:
+                summary_pdf = pdf_generator.generate_contractor_summary_pdf(
+                    period_label, grouped, grand_hours, grand_amount,
+                    logo_path=str(LOGO_PATH) if LOGO_PATH.exists() else None,
+                )
+                st.download_button(
+                    '⬇ PDF', data=summary_pdf,
+                    file_name=f'contractor_payment_summary_{range_start}_{range_end}.pdf',
+                    mime='application/pdf', use_container_width=True, type='primary',
+                )
+            except Exception as e:
+                st.error(f'Could not generate PDF: {e}')
 
 # ── Tab: History ────────────────────────────────────────────────────────────
 with tab_history:
