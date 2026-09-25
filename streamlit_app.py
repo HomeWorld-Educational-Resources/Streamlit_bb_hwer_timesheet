@@ -1,5 +1,6 @@
 import csv
 import io
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -329,6 +330,74 @@ def _build_contractor_summary_csv(period_label, grouped, grand_hours, grand_amou
     row('GRAND TOTAL', f'{grand_hours:g}', f'${grand_amount:,.2f}')
 
     return buf.getvalue().encode('utf-8-sig')  # BOM for Excel compat
+
+
+def _build_ai_bundle_prompt_text(customer_name, milestones):
+    tagged = [m for m in milestones if (m.get('category') or '') in
+             (NIW_PRONGS + EB1A_CRITERIA)]
+    categories_present = sorted(set(m.get('category') for m in tagged))
+
+    lines = [
+        'You are assisting with an immigration petition — EB1A (extraordinary ability) and/or '
+        'NIW (National Interest Waiver). Be a rigorous, honest evaluator; do not inflate the '
+        'assessment and do not invent evidence that is not listed in milestones.csv.',
+        '',
+        f'Client: {customer_name}',
+        '',
+        'milestones.csv (attached) lists this client\'s evidence/work items. Each row has: '
+        'Category, Milestone, Target Date, % Complete, Status, Notes.',
+        '',
+        'For EACH category below that has at least one milestone in the CSV, provide:',
+        '  1. An estimated strength score (0-100%) based only on the listed evidence.',
+        '  2. A short (2-3 sentence) assessment of current strength.',
+        '  3. Specific gaps or weaknesses.',
+        '  4. Concrete, actionable next steps to strengthen that category.',
+        '',
+        'Categories present in this client\'s data:',
+    ]
+    for cat in categories_present:
+        definition = ai_estimator.CATEGORY_DEFINITIONS.get(cat, '')
+        lines.append(f'  - {cat}: {definition}')
+    if not categories_present:
+        lines.append('  (No milestones are tagged to an EB1A/NIW category yet — assess general progress instead.)')
+    lines += [
+        '',
+        'Present your response as one section per category, in the order listed above, '
+        'each with the four numbered items.',
+    ]
+    return '\n'.join(lines)
+
+
+def _build_ai_bundle_zip(customer, milestones):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('README_PROMPT.txt', _build_ai_bundle_prompt_text(customer.get('name', ''), milestones))
+
+        info_lines = [
+            f"Customer: {customer.get('name', '')}",
+            f"Company/Project: {customer.get('company_project', '')}",
+            f"Contract Note: {customer.get('contract_note', '')}",
+            f"Footnote: {customer.get('footnote', '')}",
+            f"Bundle Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ]
+        zf.writestr('customer_info.txt', '\n'.join(info_lines))
+
+        csv_buf = io.StringIO()
+        w = csv.writer(csv_buf)
+        w.writerow(['Category', 'Milestone', 'Target Date', '% Complete', 'Status', 'Notes'])
+        for m in milestones:
+            w.writerow([
+                m.get('category') or '',
+                m.get('title') or '',
+                m.get('target_date') or '',
+                m.get('percent_complete', 0) or 0,
+                m.get('status') or '',
+                m.get('notes') or '',
+            ])
+        zf.writestr('milestones.csv', csv_buf.getvalue())
+
+    buf.seek(0)
+    return buf.getvalue()
 
 
 
@@ -957,37 +1026,31 @@ with tab_milestones:
                     crit_df = pd.DataFrame({'% Complete': crit_avgs})
                     st.bar_chart(crit_df, horizontal=True, height=max(200, 40 * len(crit_avgs)))
 
-            # ── AI Assessment ─────────────────────────────────────────────────
-            st.subheader('AI Assessment')
-            ai_providers = ai_estimator.available_providers()
+            # ── AI Estimation ────────────────────────────────────────────────
+            st.subheader('AI Estimation')
             tagged_categories = sorted(set(
                 m.get('category') for m in active
                 if (m.get('category') or '') in (NIW_PRONGS + EB1A_CRITERIA)
             ))
 
-            if not ai_providers:
+            st.markdown('**Option 1 — Assess in-app (OpenAI)**')
+            if not ai_estimator.is_configured():
                 st.info(
-                    'No AI provider configured. Add `anthropic_api_key` and/or `openai_api_key` '
-                    'to your Streamlit secrets to enable AI-powered strength/gap assessments '
-                    'per category. See ai_estimator.py for the exact secrets format.'
+                    'No OpenAI key configured. Add `openai_api_key` to your Streamlit secrets '
+                    'to enable in-app AI strength/gap assessments per category. '
+                    'See ai_estimator.py for the exact secrets format.'
                 )
             elif not tagged_categories:
                 st.info('Tag at least one milestone with an EB1A criterion or NIW prong category above to enable AI assessment.')
             else:
-                st.caption('AI reads the milestones tagged to a category and estimates overall strength, gaps, and next steps. Nothing is auto-applied to your data — review before acting on it.')
-                ac1, ac2 = st.columns(2)
-                with ac1:
-                    ai_category = st.selectbox('Category to assess', options=tagged_categories, key='ai_category_select')
-                with ac2:
-                    ai_provider = st.selectbox('AI Provider', options=ai_providers, key='ai_provider_select')
+                st.caption('Reads the milestones tagged to a category and estimates overall strength, gaps, and next steps. Nothing is auto-applied to your data — review before acting on it.')
+                ai_category = st.selectbox('Category to assess', options=tagged_categories, key='ai_category_select')
 
                 if st.button('Get AI Assessment'):
                     cat_milestones = [m for m in active if m.get('category') == ai_category]
-                    with st.spinner(f'Assessing {ai_category} with {ai_provider}...'):
+                    with st.spinner(f'Assessing {ai_category}...'):
                         try:
-                            result = ai_estimator.estimate_category(
-                                ai_provider, ai_category, cat_milestones, ss.cust_name
-                            )
+                            result = ai_estimator.estimate_category(ai_category, cat_milestones, ss.cust_name)
                             ss.ai_assessment_result = result
                             ss.ai_assessment_category = ai_category
                             ss.status = 'AI assessment complete.'
@@ -1011,6 +1074,33 @@ with tab_milestones:
                         st.markdown('**Suggestions**')
                         for s in suggestions:
                             st.markdown(f'- {s}')
+
+            st.divider()
+            st.markdown('**Option 2 — Download a bundle for manual upload (ChatGPT, Claude.ai, etc.)**')
+            st.caption(
+                'No API key needed for this option. Downloads a ZIP with a ready-made prompt, '
+                "this customer's info, and all their milestones — upload the ZIP's contents "
+                'directly into any chatbot to get a manual assessment. Regenerated fresh from '
+                'the currently saved milestones every time you download.'
+            )
+            bundle_zip = _build_ai_bundle_zip(
+                {
+                    'name': ss.cust_name,
+                    'company_project': ss.cust_company,
+                    'contract_note': ss.cust_contract_note,
+                    'footnote': ss.cust_footnote,
+                },
+                active,
+            )
+            safe_bundle_name = ''.join(
+                c if c.isalnum() or c in (' ', '-', '_') else '_' for c in (ss.cust_name or 'customer')
+            ).strip().replace(' ', '_')
+            st.download_button(
+                '⬇ Download AI Estimation Bundle (ZIP)',
+                data=bundle_zip,
+                file_name=f'{safe_bundle_name}_niw_eb1a_bundle.zip',
+                mime='application/zip',
+            )
 
 # ── Tab: Contractors ─────────────────────────────────────────────────────────
 with tab_contractors:

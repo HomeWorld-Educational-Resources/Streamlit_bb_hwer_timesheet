@@ -1,32 +1,25 @@
 """
-AI-powered assessment of NIW prong / EB1A criterion strength.
+AI-powered assessment of NIW prong / EB1A criterion strength, using OpenAI.
 
-Supports both Claude (Anthropic) and GPT (OpenAI) — whichever the user has
-configured. API keys are read ONLY from Streamlit secrets, never hardcoded
-and never committed to git.
+The API key is read ONLY from Streamlit secrets, never hardcoded and never
+committed to git.
 
-Add to .streamlit/secrets.toml locally, and to the same keys under
+Add to .streamlit/secrets.toml locally, and to the same key under
 Streamlit Community Cloud's "Manage app -> Settings -> Secrets":
 
-    anthropic_api_key = "sk-ant-..."
     openai_api_key = "sk-..."
 
-    # Optional — pin a specific model version. Provider model names change
+    # Optional — pin a specific model version. OpenAI's model names change
     # fairly often; if a request starts failing with a "model not found"
-    # error, check the provider's docs for the current model id and set it
-    # here rather than editing code.
-    anthropic_model = "claude-sonnet-5"
+    # error, check OpenAI's docs for the current model id and set it here
+    # rather than editing code.
     openai_model = "gpt-5-mini"
 """
 import json
 
 import streamlit as st
 
-DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-5'
 DEFAULT_OPENAI_MODEL = 'gpt-5-mini'
-
-PROVIDER_ANTHROPIC = 'Claude (Anthropic)'
-PROVIDER_OPENAI = 'OpenAI (GPT)'
 
 CATEGORY_DEFINITIONS = {
     'EB1A - Awards':
@@ -69,20 +62,12 @@ CATEGORY_DEFINITIONS = {
 }
 
 
-def available_providers():
-    """Which providers have a usable key configured in Streamlit secrets."""
-    providers = []
+def is_configured():
+    """Whether an OpenAI key is available in Streamlit secrets."""
     try:
-        if st.secrets.get('anthropic_api_key'):
-            providers.append(PROVIDER_ANTHROPIC)
+        return bool(st.secrets.get('openai_api_key'))
     except Exception:
-        pass
-    try:
-        if st.secrets.get('openai_api_key'):
-            providers.append(PROVIDER_OPENAI)
-    except Exception:
-        pass
-    return providers
+        return False
 
 
 def _build_prompt(category, milestones, customer_name):
@@ -130,39 +115,20 @@ def _parse_json_response(text):
     return json.loads(text)
 
 
-def estimate_category(provider, category, milestones, customer_name):
+def estimate_category(category, milestones, customer_name):
     """Returns {strength_percent, summary, gaps, suggestions}. Raises on failure —
     caller is expected to catch and display the error."""
+    import openai
+    key = st.secrets.get('openai_api_key')
+    if not key:
+        raise RuntimeError('openai_api_key is not set in Streamlit secrets.')
+    model = st.secrets.get('openai_model', DEFAULT_OPENAI_MODEL)
     prompt = _build_prompt(category, milestones, customer_name)
-
-    if provider == PROVIDER_ANTHROPIC:
-        import anthropic
-        key = st.secrets.get('anthropic_api_key')
-        if not key:
-            raise RuntimeError('anthropic_api_key is not set in Streamlit secrets.')
-        model = st.secrets.get('anthropic_model', DEFAULT_ANTHROPIC_MODEL)
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=800,
-            messages=[{'role': 'user', 'content': prompt}],
-        )
-        text = ''.join(b.text for b in resp.content if getattr(b, 'type', '') == 'text')
-        return _parse_json_response(text)
-
-    elif provider == PROVIDER_OPENAI:
-        import openai
-        key = st.secrets.get('openai_api_key')
-        if not key:
-            raise RuntimeError('openai_api_key is not set in Streamlit secrets.')
-        model = st.secrets.get('openai_model', DEFAULT_OPENAI_MODEL)
-        client = openai.OpenAI(api_key=key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=800,
-        )
-        text = resp.choices[0].message.content
-        return _parse_json_response(text)
-
-    raise ValueError(f'Unknown provider: {provider}')
+    client = openai.OpenAI(api_key=key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{'role': 'user', 'content': prompt}],
+        max_tokens=800,
+    )
+    text = resp.choices[0].message.content
+    return _parse_json_response(text)
