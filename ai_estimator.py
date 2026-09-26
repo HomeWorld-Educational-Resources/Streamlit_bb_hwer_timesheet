@@ -61,6 +61,24 @@ CATEGORY_DEFINITIONS = {
         'labor certification requirement (Matter of Dhanasar, prong 3).',
 }
 
+CAREER_CATEGORY_DEFINITIONS = {
+    'Milestone': 'A specific achievement or checkpoint on the way to the target role.',
+    'Goal': 'A stated objective the client is working toward.',
+    'Strategic Plan': 'The overall plan or approach for reaching the target role.',
+    'Proposed Activity': 'A planned action or project not yet completed.',
+    'Skill/Experience Gained': 'A skill, credential, or experience the client has gained relevant to the target role.',
+}
+
+IMPACT_CATEGORY_DEFINITIONS = {
+    'Media Coverage': 'Press, interviews, or media features about the client or their work.',
+    'Paper Citations': "Citation counts or citation-worthy recognition of the client's publications.",
+    'GitHub Stars': "Stars or community engagement on the client's open-source projects.",
+    'Downloads': "Download or usage counts for the client's software, tools, or datasets.",
+    'White Papers': "White papers or technical reports authored or co-authored by the client.",
+    'Honors': 'Awards, honors, or formal recognitions received by the client.',
+    'Other': 'Other measurable real-world impact not covered by the categories above.',
+}
+
 
 def is_configured():
     """Whether an OpenAI key is available in Streamlit secrets."""
@@ -70,7 +88,47 @@ def is_configured():
         return False
 
 
-def _build_prompt(category, milestones, customer_name):
+def _parse_json_response(text):
+    text = text.strip()
+    if text.startswith('```'):
+        text = text.strip('`')
+        if text.lower().startswith('json'):
+            text = text[4:]
+        text = text.strip()
+    return json.loads(text)
+
+
+def _response_instructions():
+    return (
+        "Respond with ONLY a JSON object — no markdown, no code fences, no commentary before "
+        "or after it — in exactly this shape:\n"
+        '{"strength_percent": <integer 0-100>, '
+        '"summary": "<2-3 sentence assessment of overall strength>", '
+        '"gaps": ["<specific missing evidence or weakness>", ...], '
+        '"suggestions": ["<concrete next step to strengthen this category>", ...]}\n'
+        "Limit gaps and suggestions to at most 4 items each; keep each item specific and actionable."
+    )
+
+
+def _call_openai(prompt):
+    """Returns {strength_percent, summary, gaps, suggestions}. Raises on failure —
+    caller is expected to catch and display the error."""
+    import openai
+    key = st.secrets.get('openai_api_key')
+    if not key:
+        raise RuntimeError('openai_api_key is not set in Streamlit secrets.')
+    model = st.secrets.get('openai_model', DEFAULT_OPENAI_MODEL)
+    client = openai.OpenAI(api_key=key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{'role': 'user', 'content': prompt}],
+        max_tokens=800,
+    )
+    return _parse_json_response(resp.choices[0].message.content)
+
+
+def estimate_category(category, milestones, customer_name):
+    """Immigration (EB1A/NIW) assessment."""
     definition = CATEGORY_DEFINITIONS.get(category, '')
     lines = [
         "You are assisting an immigration case team in assessing evidence strength for a "
@@ -93,42 +151,71 @@ def _build_prompt(category, milestones, customer_name):
     lines += [
         "",
         "Based ONLY on the evidence listed above (do not invent evidence that isn't listed), "
-        "assess how strong this category currently is for the petition. "
-        "Respond with ONLY a JSON object — no markdown, no code fences, no commentary before "
-        "or after it — in exactly this shape:",
-        '{"strength_percent": <integer 0-100>, '
-        '"summary": "<2-3 sentence assessment of overall strength>", '
-        '"gaps": ["<specific missing evidence or weakness>", ...], '
-        '"suggestions": ["<concrete next step to strengthen this category>", ...]}',
-        "Limit gaps and suggestions to at most 4 items each; keep each item specific and actionable.",
+        "assess how strong this category currently is for the petition.",
+        "",
+        _response_instructions(),
     ]
-    return '\n'.join(lines)
+    return _call_openai('\n'.join(lines))
 
 
-def _parse_json_response(text):
-    text = text.strip()
-    if text.startswith('```'):
-        text = text.strip('`')
-        if text.lower().startswith('json'):
-            text = text[4:]
-        text = text.strip()
-    return json.loads(text)
+def estimate_career_category(category, items, customer_name, target_role):
+    """Career progress assessment for one category, toward a stated target role."""
+    definition = CAREER_CATEGORY_DEFINITIONS.get(category, '')
+    lines = [
+        "You are a career coach assessing a client's progress toward a specific target role. "
+        "Be a rigorous, honest evaluator — do not inflate the assessment.",
+        f"Client: {customer_name}",
+        f"Target role (dream job/position/promotion): {target_role or 'not specified'}",
+        f"Category being assessed: {category}",
+        f"What this category covers: {definition}",
+        "",
+        "Below are the items logged under this category, each with target date, completion "
+        "percentage, status, and notes:",
+        "",
+    ]
+    for it in items:
+        lines.append(
+            f'- "{it.get("title")}" | Status: {it.get("status")} | '
+            f'% Complete: {it.get("percent_complete", 0):g}% | '
+            f'Target Date: {it.get("target_date") or "n/a"} | '
+            f'Notes: {it.get("notes") or "none"}'
+        )
+    lines += [
+        "",
+        "Based ONLY on the items listed above (do not invent evidence that isn't listed), "
+        "assess how strong this category currently is toward the target role.",
+        "",
+        _response_instructions(),
+    ]
+    return _call_openai('\n'.join(lines))
 
 
-def estimate_category(category, milestones, customer_name):
-    """Returns {strength_percent, summary, gaps, suggestions}. Raises on failure —
-    caller is expected to catch and display the error."""
-    import openai
-    key = st.secrets.get('openai_api_key')
-    if not key:
-        raise RuntimeError('openai_api_key is not set in Streamlit secrets.')
-    model = st.secrets.get('openai_model', DEFAULT_OPENAI_MODEL)
-    prompt = _build_prompt(category, milestones, customer_name)
-    client = openai.OpenAI(api_key=key)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{'role': 'user', 'content': prompt}],
-        max_tokens=800,
-    )
-    text = resp.choices[0].message.content
-    return _parse_json_response(text)
+def estimate_impact_category(category, items, customer_name):
+    """Real-world impact evidence assessment for one category."""
+    definition = IMPACT_CATEGORY_DEFINITIONS.get(category, '')
+    lines = [
+        "You are assisting in assessing the strength of a client's real-world impact evidence "
+        "for this category. Be a rigorous, honest evaluator — do not inflate the assessment.",
+        f"Client: {customer_name}",
+        f"Category being assessed: {category}",
+        f"What this category covers: {definition}",
+        "",
+        "Below are the achievements logged under this category, each with its metric/value, "
+        "whether BaoBunny directly helped produce it (BB Supported), date, and notes:",
+        "",
+    ]
+    for it in items:
+        lines.append(
+            f'- "{it.get("title")}" | Metric/Value: {it.get("metric_value") or "n/a"} | '
+            f'BB Supported: {"Yes" if it.get("bb_supported") else "No"} | '
+            f'Date: {it.get("item_date") or "n/a"} | '
+            f'Notes: {it.get("notes") or "none"}'
+        )
+    lines += [
+        "",
+        "Based ONLY on the achievements listed above (do not invent evidence that isn't listed), "
+        "assess how strong this category currently is as impact evidence.",
+        "",
+        _response_instructions(),
+    ]
+    return _call_openai('\n'.join(lines))

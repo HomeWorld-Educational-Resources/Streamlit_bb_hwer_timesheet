@@ -41,6 +41,12 @@ NIW_PRONGS = [
 ]
 MILESTONE_CATEGORIES = ['—'] + EB1A_CRITERIA + NIW_PRONGS + ['Other']
 
+CAREER_CATEGORIES = ['Milestone', 'Goal', 'Strategic Plan', 'Proposed Activity', 'Skill/Experience Gained']
+MAX_CAREER_ROWS = 20
+
+IMPACT_CATEGORIES = ['Media Coverage', 'Paper Citations', 'GitHub Stars', 'Downloads', 'White Papers', 'Honors', 'Other']
+MAX_IMPACT_ROWS = 20
+
 st.set_page_config(page_title='Customer Timesheet Builder', layout='wide')
 
 # ── password gate ─────────────────────────────────────────────────────────────
@@ -203,6 +209,56 @@ def _milestones_from_db(customer_id):
     while len(result) < MAX_MILESTONE_ROWS:
         result.append({'Milestone': '', 'Category': '—', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''})
     return pd.DataFrame(result[:MAX_MILESTONE_ROWS])
+
+
+def _blank_career_items():
+    return pd.DataFrame([
+        {'Category': 'Milestone', 'Item': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''}
+        for _ in range(MAX_CAREER_ROWS)
+    ])
+
+
+def _career_items_from_db(customer_id):
+    rows = db.get_career_items(customer_id)
+    result = [
+        {
+            'Category': it.get('category') or 'Milestone',
+            'Item': it.get('title') or '',
+            'Target Date': it.get('target_date') or '',
+            '% Complete': it.get('percent_complete', 0) or 0,
+            'Status': it.get('status') or 'Not Started',
+            'Notes': it.get('notes') or '',
+        }
+        for it in rows
+    ]
+    while len(result) < MAX_CAREER_ROWS:
+        result.append({'Category': 'Milestone', 'Item': '', 'Target Date': '', '% Complete': 0, 'Status': 'Not Started', 'Notes': ''})
+    return pd.DataFrame(result[:MAX_CAREER_ROWS])
+
+
+def _blank_impact_items():
+    return pd.DataFrame([
+        {'Category': 'Media Coverage', 'Item': '', 'Metric/Value': '', 'BB Supported': False, 'Date': '', 'Notes': ''}
+        for _ in range(MAX_IMPACT_ROWS)
+    ])
+
+
+def _impact_items_from_db(customer_id):
+    rows = db.get_impact_items(customer_id)
+    result = [
+        {
+            'Category': it.get('category') or 'Media Coverage',
+            'Item': it.get('title') or '',
+            'Metric/Value': it.get('metric_value') or '',
+            'BB Supported': bool(it.get('bb_supported', False)),
+            'Date': it.get('item_date') or '',
+            'Notes': it.get('notes') or '',
+        }
+        for it in rows
+    ]
+    while len(result) < MAX_IMPACT_ROWS:
+        result.append({'Category': 'Media Coverage', 'Item': '', 'Metric/Value': '', 'BB Supported': False, 'Date': '', 'Notes': ''})
+    return pd.DataFrame(result[:MAX_IMPACT_ROWS])
 
 
 def _contractor_entries_from_db(contractor_id):
@@ -368,38 +424,143 @@ def _build_ai_bundle_prompt_text(customer_name, milestones):
     return '\n'.join(lines)
 
 
-def _build_ai_bundle_zip(customer, milestones):
+def _build_bundle_zip(prompt_text, info_lines, csv_filename, csv_header, csv_rows):
+    """Shared ZIP writer: README_PROMPT.txt + customer_info.txt + one data CSV."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('README_PROMPT.txt', _build_ai_bundle_prompt_text(customer.get('name', ''), milestones))
-
-        info_lines = [
-            f"Customer: {customer.get('name', '')}",
-            f"Company/Project: {customer.get('company_project', '')}",
-            f"Contract Note: {customer.get('contract_note', '')}",
-            f"Footnote: {customer.get('footnote', '')}",
-            f"Bundle Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        ]
+        zf.writestr('README_PROMPT.txt', prompt_text)
         zf.writestr('customer_info.txt', '\n'.join(info_lines))
-
         csv_buf = io.StringIO()
         w = csv.writer(csv_buf)
-        w.writerow(['Category', 'Milestone', 'Target Date', '% Complete', 'Status', 'Notes'])
-        for m in milestones:
-            w.writerow([
-                m.get('category') or '',
-                m.get('title') or '',
-                m.get('target_date') or '',
-                m.get('percent_complete', 0) or 0,
-                m.get('status') or '',
-                m.get('notes') or '',
-            ])
-        zf.writestr('milestones.csv', csv_buf.getvalue())
-
+        w.writerow(csv_header)
+        for row in csv_rows:
+            w.writerow(row)
+        zf.writestr(csv_filename, csv_buf.getvalue())
     buf.seek(0)
     return buf.getvalue()
 
 
+def _build_ai_bundle_zip(customer, milestones):
+    info_lines = [
+        f"Customer: {customer.get('name', '')}",
+        f"Company/Project: {customer.get('company_project', '')}",
+        f"Contract Note: {customer.get('contract_note', '')}",
+        f"Footnote: {customer.get('footnote', '')}",
+        f"Bundle Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ]
+    csv_rows = [[
+        m.get('category') or '', m.get('title') or '', m.get('target_date') or '',
+        m.get('percent_complete', 0) or 0, m.get('status') or '', m.get('notes') or '',
+    ] for m in milestones]
+    return _build_bundle_zip(
+        _build_ai_bundle_prompt_text(customer.get('name', ''), milestones),
+        info_lines, 'milestones.csv',
+        ['Category', 'Milestone', 'Target Date', '% Complete', 'Status', 'Notes'],
+        csv_rows,
+    )
+
+
+def _build_career_bundle_prompt_text(customer_name, target_role, items):
+    categories_present = sorted(set(it.get('category') for it in items if it.get('category')))
+    lines = [
+        "You are a career coach assessing a client's progress toward a specific target role. "
+        "Be a rigorous, honest evaluator; do not inflate the assessment and do not invent "
+        "evidence that is not listed in career_items.csv.",
+        '',
+        f'Client: {customer_name}',
+        f'Target role (dream job/position/promotion): {target_role or "not specified"}',
+        '',
+        "career_items.csv (attached) lists this client's career items. Each row has: "
+        "Category, Item, Target Date, % Complete, Status, Notes.",
+        '',
+        'For EACH category below that has at least one item in the CSV, provide:',
+        '  1. An estimated strength score (0-100%) based only on the listed items.',
+        '  2. A short (2-3 sentence) assessment of current progress.',
+        '  3. Specific gaps or weaknesses relative to the target role.',
+        '  4. Concrete, actionable next steps.',
+        '',
+        "Categories present in this client's data:",
+    ]
+    for cat in categories_present:
+        lines.append(f'  - {cat}: {ai_estimator.CAREER_CATEGORY_DEFINITIONS.get(cat, "")}')
+    if not categories_present:
+        lines.append('  (No career items logged yet — assess general readiness instead.)')
+    lines += [
+        '',
+        'Present your response as one section per category, in the order listed above, '
+        'each with the four numbered items, then one overall paragraph on readiness for the target role.',
+    ]
+    return '\n'.join(lines)
+
+
+def _build_career_bundle_zip(customer, items):
+    info_lines = [
+        f"Customer: {customer.get('name', '')}",
+        f"Target Role: {customer.get('career_target', '')}",
+        f"Company/Project: {customer.get('company_project', '')}",
+        f"Bundle Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ]
+    csv_rows = [[
+        it.get('category') or '', it.get('title') or '', it.get('target_date') or '',
+        it.get('percent_complete', 0) or 0, it.get('status') or '', it.get('notes') or '',
+    ] for it in items]
+    return _build_bundle_zip(
+        _build_career_bundle_prompt_text(customer.get('name', ''), customer.get('career_target', ''), items),
+        info_lines, 'career_items.csv',
+        ['Category', 'Item', 'Target Date', '% Complete', 'Status', 'Notes'],
+        csv_rows,
+    )
+
+
+def _build_impact_bundle_prompt_text(customer_name, items):
+    categories_present = sorted(set(it.get('category') for it in items if it.get('category')))
+    lines = [
+        "You are assisting in assessing the strength of a client's real-world impact evidence. "
+        "Be a rigorous, honest evaluator; do not inflate the assessment and do not invent "
+        "evidence that is not listed in impact_items.csv. Note which items are 'BB Supported' "
+        "(BaoBunny directly helped produce them) versus pre-existing achievements.",
+        '',
+        f'Client: {customer_name}',
+        '',
+        "impact_items.csv (attached) lists this client's impact achievements. Each row has: "
+        "Category, Item, Metric/Value, BB Supported, Date, Notes.",
+        '',
+        'For EACH category below that has at least one item in the CSV, provide:',
+        '  1. An estimated strength score (0-100%) based only on the listed items.',
+        '  2. A short (2-3 sentence) assessment of current strength.',
+        '  3. Specific gaps or weaknesses.',
+        '  4. Concrete, actionable next steps.',
+        '',
+        "Categories present in this client's data:",
+    ]
+    for cat in categories_present:
+        lines.append(f'  - {cat}: {ai_estimator.IMPACT_CATEGORY_DEFINITIONS.get(cat, "")}')
+    if not categories_present:
+        lines.append('  (No impact items logged yet — assess general standing instead.)')
+    lines += [
+        '',
+        'Present your response as one section per category, in the order listed above, '
+        'each with the four numbered items, then a one-line count of how many items are BB Supported.',
+    ]
+    return '\n'.join(lines)
+
+
+def _build_impact_bundle_zip(customer, items):
+    info_lines = [
+        f"Customer: {customer.get('name', '')}",
+        f"Company/Project: {customer.get('company_project', '')}",
+        f"Bundle Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ]
+    csv_rows = [[
+        it.get('category') or '', it.get('title') or '', it.get('metric_value') or '',
+        'Yes' if it.get('bb_supported') else 'No', it.get('item_date') or '', it.get('notes') or '',
+    ] for it in items]
+    return _build_bundle_zip(
+        _build_impact_bundle_prompt_text(customer.get('name', ''), items),
+        info_lines, 'impact_items.csv',
+        ['Category', 'Item', 'Metric/Value', 'BB Supported', 'Date', 'Notes'],
+        csv_rows,
+    )
 
 
 def _select_customer(cust):
@@ -417,6 +578,15 @@ def _select_customer(cust):
     ss.activities_df = _acts_from_db(cust['id'])
     ss.payments_df = _pmts_from_db(cust['id'])
     ss.milestones_df = _milestones_from_db(cust['id'])
+    ss.career_items_df = _career_items_from_db(cust['id'])
+    ss.impact_items_df = _impact_items_from_db(cust['id'])
+    ss.career_target = str(cust.get('career_target') or '')
+    ss.resume_doc_url = str(cust.get('resume_doc_url') or '')
+    ss.resume_folder_url = str(cust.get('resume_folder_url') or '')
+    ss.cv_doc_url = str(cust.get('cv_doc_url') or '')
+    ss.cv_folder_url = str(cust.get('cv_folder_url') or '')
+    ss.petition_doc_url = str(cust.get('petition_doc_url') or '')
+    ss.petition_folder_url = str(cust.get('petition_folder_url') or '')
     ss.editor_v += 1
     ss.generated_bytes = None
     ss.generated_name = None
@@ -439,6 +609,15 @@ def _clear_for_new():
     ss.activities_df = _blank_acts()
     ss.payments_df = _blank_pmts()
     ss.milestones_df = _blank_milestones()
+    ss.career_items_df = _blank_career_items()
+    ss.impact_items_df = _blank_impact_items()
+    ss.career_target = ''
+    ss.resume_doc_url = ''
+    ss.resume_folder_url = ''
+    ss.cv_doc_url = ''
+    ss.cv_folder_url = ''
+    ss.petition_doc_url = ''
+    ss.petition_folder_url = ''
     ss.editor_v += 1
     ss.generated_bytes = None
     ss.generated_name = None
@@ -484,6 +663,15 @@ def _init():
     ss.activities_df = _blank_acts()
     ss.payments_df = _blank_pmts()
     ss.milestones_df = _blank_milestones()
+    ss.career_items_df = _blank_career_items()
+    ss.impact_items_df = _blank_impact_items()
+    ss.career_target = ''
+    ss.resume_doc_url = ''
+    ss.resume_folder_url = ''
+    ss.cv_doc_url = ''
+    ss.cv_folder_url = ''
+    ss.petition_doc_url = ''
+    ss.petition_folder_url = ''
     # customer form widget keys
     ss.cust_name = ''
     ss.cust_company = ''
@@ -601,6 +789,71 @@ def _do_save_milestones(milestones_df):
     ss.milestones_df = _milestones_from_db(ss.customer_id)
     ss.editor_v += 1
     ss.status = f'Saved {len(rows)} milestone(s).'
+    ss.status_type = 'success'
+
+
+def _do_save_career_items(career_df):
+    ss = st.session_state
+    if not ss.customer_id:
+        ss.status = 'Error: Save customer first before saving career items.'
+        ss.status_type = 'error'
+        return
+    rows = []
+    for _, r in career_df.iterrows():
+        title = str(r.get('Item', '')).strip()
+        if not title:
+            continue
+        pct = _sf(r.get('% Complete'), 0.0) or 0.0
+        pct = max(0.0, min(100.0, pct))
+        rows.append({
+            'category': str(r.get('Category', '') or 'Milestone').strip(),
+            'title': title,
+            'target_date': str(r.get('Target Date', '')).strip(),
+            'percent_complete': pct,
+            'status': str(r.get('Status', '') or 'Not Started').strip(),
+            'notes': str(r.get('Notes', '')).strip(),
+        })
+    db.replace_career_items(ss.customer_id, rows)
+    ss.career_items_df = _career_items_from_db(ss.customer_id)
+    ss.editor_v += 1
+    ss.status = f'Saved {len(rows)} career item(s).'
+    ss.status_type = 'success'
+
+
+def _do_save_impact_items(impact_df):
+    ss = st.session_state
+    if not ss.customer_id:
+        ss.status = 'Error: Save customer first before saving impact items.'
+        ss.status_type = 'error'
+        return
+    rows = []
+    for _, r in impact_df.iterrows():
+        title = str(r.get('Item', '')).strip()
+        if not title:
+            continue
+        rows.append({
+            'category': str(r.get('Category', '') or 'Other').strip(),
+            'title': title,
+            'metric_value': str(r.get('Metric/Value', '')).strip(),
+            'bb_supported': bool(r.get('BB Supported', False)),
+            'item_date': str(r.get('Date', '')).strip(),
+            'notes': str(r.get('Notes', '')).strip(),
+        })
+    db.replace_impact_items(ss.customer_id, rows)
+    ss.impact_items_df = _impact_items_from_db(ss.customer_id)
+    ss.editor_v += 1
+    ss.status = f'Saved {len(rows)} impact item(s).'
+    ss.status_type = 'success'
+
+
+def _do_save_customer_links(**fields):
+    ss = st.session_state
+    if not ss.customer_id:
+        ss.status = 'Error: Save customer first before saving document links.'
+        ss.status_type = 'error'
+        return
+    db.update_customer_links(ss.customer_id, **fields)
+    ss.status = 'Links saved.'
     ss.status_type = 'success'
 
 
@@ -834,8 +1087,8 @@ with st.sidebar:
 
 
 # ── Main: tabs ────────────────────────────────────────────────────────────────
-tab_sheet, tab_payments, tab_milestones, tab_contractors, tab_history = st.tabs(
-    ['New Timesheet', 'Payments', 'Milestones', 'Contractors', 'History']
+tab_sheet, tab_payments, tab_career, tab_impact, tab_immigration, tab_contractors, tab_history = st.tabs(
+    ['New Timesheet', 'Payments', 'Career', 'Impact', 'Immigration', 'Contractors', 'History']
 )
 
 # ── Tab 1: New Timesheet ──────────────────────────────────────────────────────
@@ -925,14 +1178,284 @@ with tab_payments:
         _do_save_payments(payments_df)
         st.rerun()
 
-# ── Tab: Milestones ────────────────────────────────────────────────────────────
-with tab_milestones:
+# ── Tab: Career ───────────────────────────────────────────────────────────────
+with tab_career:
     if not ss.customer_id:
-        st.info('Select or create a customer to track milestones.')
+        st.info('Select or create a customer to track their career growth.')
     else:
-        st.subheader(f'Milestone Progress — {ss.cust_name}')
-        st.caption('Track project milestones, target dates, and completion status for this customer.')
+        st.subheader(f'Career — {ss.cust_name}')
+        st.caption('Track milestones, goals, strategic plan, proposed activities, and skills/experience gained toward the target role.')
+
+        st.text_input('Target Role (dream job / position / promotion)', key='career_target')
+
+        with st.expander('Documents (Google Drive)', expanded=not (ss.resume_doc_url or ss.resume_folder_url)):
+            st.text_input('Resume (Drive link)', key='resume_doc_url')
+            st.text_input('Supporting Docs Folder (Drive link)', key='resume_folder_url')
+            if st.button('Save Links', key='save_career_links'):
+                _do_save_customer_links(
+                    career_target=ss.career_target.strip(),
+                    resume_doc_url=ss.resume_doc_url.strip(),
+                    resume_folder_url=ss.resume_folder_url.strip(),
+                )
+                st.rerun()
+            lcol1, lcol2 = st.columns(2)
+            with lcol1:
+                if ss.resume_doc_url:
+                    st.link_button('Open Resume ↗', ss.resume_doc_url, use_container_width=True)
+            with lcol2:
+                if ss.resume_folder_url:
+                    st.link_button('Open Supporting Docs Folder ↗', ss.resume_folder_url, use_container_width=True)
+
+        career_df = st.data_editor(
+            ss.career_items_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows='dynamic',
+            column_config={
+                'Category': st.column_config.SelectboxColumn('Category', options=CAREER_CATEGORIES, width='medium'),
+                'Item': st.column_config.TextColumn('Item', width='large'),
+                'Target Date': st.column_config.TextColumn('Target Date (e.g. Jan-26-2026)', width='medium'),
+                '% Complete': st.column_config.NumberColumn('% Complete', min_value=0, max_value=100, step=5, width='small'),
+                'Status': st.column_config.SelectboxColumn('Status', options=MILESTONE_STATUSES, width='small'),
+                'Notes': st.column_config.TextColumn('Notes', width='large'),
+            },
+            key=f'career_editor_{ss.editor_v}',
+        )
+
+        if st.button('Save Career Items', type='primary'):
+            _do_save_career_items(career_df)
+            st.rerun()
+
+        st.divider()
+
+        saved_career = db.get_career_items(ss.customer_id)
+        active_career = [it for it in saved_career if (it.get('title') or '').strip()]
+
+        if not active_career:
+            st.info('No career items saved yet — add rows above and click Save Career Items.')
+        else:
+            overall = sum(it.get('percent_complete', 0) or 0 for it in active_career) / len(active_career)
+            st.metric('Overall Progress', f'{overall:.0f}%')
+
+            st.subheader('Progress Table')
+            progress_view = pd.DataFrame([{
+                'Item': it['title'],
+                'Category': it.get('category') or '',
+                'Target Date': it.get('target_date', ''),
+                'Status': it.get('status', ''),
+                'Progress': (it.get('percent_complete', 0) or 0) / 100.0,
+            } for it in active_career])
+            st.dataframe(
+                progress_view, use_container_width=True, hide_index=True,
+                column_config={'Progress': st.column_config.ProgressColumn('Progress', min_value=0, max_value=1, format='%.0f%%')},
+            )
+
+            st.subheader('Progress by Category')
+            cat_avgs = {}
+            for cat in CAREER_CATEGORIES:
+                cat_items = [it for it in active_career if it.get('category') == cat]
+                if cat_items:
+                    cat_avgs[cat] = sum(it.get('percent_complete', 0) or 0 for it in cat_items) / len(cat_items)
+            if cat_avgs:
+                st.bar_chart(pd.DataFrame({'% Complete': cat_avgs}), horizontal=True, height=max(150, 40 * len(cat_avgs)))
+
+            # ── AI Estimation ─────────────────────────────────────────────────
+            st.subheader('AI Estimation')
+            career_tagged = sorted(set(it.get('category') for it in active_career if it.get('category')))
+
+            st.markdown('**Option 1 — Assess in-app (OpenAI)**')
+            if not ai_estimator.is_configured():
+                st.info('No OpenAI key configured. Add `openai_api_key` to your Streamlit secrets to enable in-app assessments.')
+            else:
+                st.caption('Reads the items in a category and estimates overall strength toward the target role, gaps, and next steps.')
+                career_ai_category = st.selectbox('Category to assess', options=career_tagged, key='career_ai_category_select')
+
+                if st.button('Get AI Assessment', key='career_ai_button'):
+                    cat_items = [it for it in active_career if it.get('category') == career_ai_category]
+                    with st.spinner(f'Assessing {career_ai_category}...'):
+                        try:
+                            result = ai_estimator.estimate_career_category(
+                                career_ai_category, cat_items, ss.cust_name, ss.career_target
+                            )
+                            ss.career_ai_result = result
+                            ss.career_ai_category_done = career_ai_category
+                        except Exception as e:
+                            ss.career_ai_result = None
+                            st.error(f'AI assessment failed: {e}')
+
+                if ss.get('career_ai_result') and ss.get('career_ai_category_done') == career_ai_category:
+                    result = ss.career_ai_result
+                    st.metric('AI-Estimated Strength', f"{result.get('strength_percent', 0)}%")
+                    st.write(result.get('summary', ''))
+                    gcol, scol = st.columns(2)
+                    with gcol:
+                        st.markdown('**Gaps**')
+                        for g in (result.get('gaps') or []):
+                            st.markdown(f'- {g}')
+                    with scol:
+                        st.markdown('**Suggestions**')
+                        for s in (result.get('suggestions') or []):
+                            st.markdown(f'- {s}')
+
+            st.divider()
+            st.markdown('**Option 2 — Download a bundle for manual upload (ChatGPT, Claude.ai, etc.)**')
+            st.caption('No API key needed. Regenerated fresh from the currently saved career items every time you download.')
+            career_bundle_zip = _build_career_bundle_zip(
+                {'name': ss.cust_name, 'career_target': ss.career_target, 'company_project': ss.cust_company},
+                active_career,
+            )
+            safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in (ss.cust_name or 'customer')).strip().replace(' ', '_')
+            st.download_button(
+                '⬇ Download Career Bundle (ZIP)', data=career_bundle_zip,
+                file_name=f'{safe_name}_career_bundle.zip', mime='application/zip',
+            )
+
+# ── Tab: Impact ───────────────────────────────────────────────────────────────
+with tab_impact:
+    if not ss.customer_id:
+        st.info('Select or create a customer to track their impact metrics.')
+    else:
+        st.subheader(f'Impact — {ss.cust_name}')
+        st.caption('Track real-world impact: media coverage, citations, GitHub stars/downloads, white papers, honors, etc.')
+        st.caption('Check "BB Supported" for achievements BaoBunny directly helped produce.')
+
+        with st.expander('Documents (Google Drive)', expanded=not (ss.cv_doc_url or ss.cv_folder_url)):
+            st.text_input('CV (Drive link)', key='cv_doc_url')
+            st.text_input('Supporting Docs Folder (Drive link)', key='cv_folder_url')
+            if st.button('Save Links', key='save_impact_links'):
+                _do_save_customer_links(
+                    cv_doc_url=ss.cv_doc_url.strip(),
+                    cv_folder_url=ss.cv_folder_url.strip(),
+                )
+                st.rerun()
+            lcol1, lcol2 = st.columns(2)
+            with lcol1:
+                if ss.cv_doc_url:
+                    st.link_button('Open CV ↗', ss.cv_doc_url, use_container_width=True)
+            with lcol2:
+                if ss.cv_folder_url:
+                    st.link_button('Open Supporting Docs Folder ↗', ss.cv_folder_url, use_container_width=True)
+
+        impact_df = st.data_editor(
+            ss.impact_items_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows='dynamic',
+            column_config={
+                'Category': st.column_config.SelectboxColumn('Category', options=IMPACT_CATEGORIES, width='medium'),
+                'Item': st.column_config.TextColumn('Item', width='large'),
+                'Metric/Value': st.column_config.TextColumn('Metric/Value', width='small'),
+                'BB Supported': st.column_config.CheckboxColumn('BB Supported', width='small'),
+                'Date': st.column_config.TextColumn('Date (e.g. Jan-26-2026)', width='medium'),
+                'Notes': st.column_config.TextColumn('Notes', width='large'),
+            },
+            key=f'impact_editor_{ss.editor_v}',
+        )
+
+        if st.button('Save Impact Items', type='primary'):
+            _do_save_impact_items(impact_df)
+            st.rerun()
+
+        st.divider()
+
+        saved_impact = db.get_impact_items(ss.customer_id)
+        active_impact = [it for it in saved_impact if (it.get('title') or '').strip()]
+
+        if not active_impact:
+            st.info('No impact items saved yet — add rows above and click Save Impact Items.')
+        else:
+            bb_count = sum(1 for it in active_impact if it.get('bb_supported'))
+            ic1, ic2 = st.columns(2)
+            ic1.metric('Total Achievements', len(active_impact))
+            ic2.metric('BB-Supported', f'{bb_count} / {len(active_impact)}')
+
+            st.subheader('By Category')
+            cat_counts = {}
+            for it in active_impact:
+                cat_counts[it.get('category') or 'Other'] = cat_counts.get(it.get('category') or 'Other', 0) + 1
+            st.bar_chart(pd.DataFrame({'Count': cat_counts}), horizontal=True, height=max(150, 40 * len(cat_counts)))
+
+            bb_items = [it for it in active_impact if it.get('bb_supported')]
+            if bb_items:
+                st.subheader('BB-Supported Highlights')
+                for it in bb_items:
+                    val = f" — {it.get('metric_value')}" if it.get('metric_value') else ''
+                    st.markdown(f"- **{it['title']}**{val} _({it.get('category', '')})_")
+
+            # ── AI Estimation ─────────────────────────────────────────────────
+            st.subheader('AI Estimation')
+            impact_tagged = sorted(set(it.get('category') for it in active_impact if it.get('category')))
+
+            st.markdown('**Option 1 — Assess in-app (OpenAI)**')
+            if not ai_estimator.is_configured():
+                st.info('No OpenAI key configured. Add `openai_api_key` to your Streamlit secrets to enable in-app assessments.')
+            else:
+                st.caption('Reads the achievements in a category and estimates overall strength, gaps, and next steps.')
+                impact_ai_category = st.selectbox('Category to assess', options=impact_tagged, key='impact_ai_category_select')
+
+                if st.button('Get AI Assessment', key='impact_ai_button'):
+                    cat_items = [it for it in active_impact if it.get('category') == impact_ai_category]
+                    with st.spinner(f'Assessing {impact_ai_category}...'):
+                        try:
+                            result = ai_estimator.estimate_impact_category(impact_ai_category, cat_items, ss.cust_name)
+                            ss.impact_ai_result = result
+                            ss.impact_ai_category_done = impact_ai_category
+                        except Exception as e:
+                            ss.impact_ai_result = None
+                            st.error(f'AI assessment failed: {e}')
+
+                if ss.get('impact_ai_result') and ss.get('impact_ai_category_done') == impact_ai_category:
+                    result = ss.impact_ai_result
+                    st.metric('AI-Estimated Strength', f"{result.get('strength_percent', 0)}%")
+                    st.write(result.get('summary', ''))
+                    gcol, scol = st.columns(2)
+                    with gcol:
+                        st.markdown('**Gaps**')
+                        for g in (result.get('gaps') or []):
+                            st.markdown(f'- {g}')
+                    with scol:
+                        st.markdown('**Suggestions**')
+                        for s in (result.get('suggestions') or []):
+                            st.markdown(f'- {s}')
+
+            st.divider()
+            st.markdown('**Option 2 — Download a bundle for manual upload (ChatGPT, Claude.ai, etc.)**')
+            st.caption('No API key needed. Regenerated fresh from the currently saved impact items every time you download.')
+            impact_bundle_zip = _build_impact_bundle_zip(
+                {'name': ss.cust_name, 'company_project': ss.cust_company},
+                active_impact,
+            )
+            safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in (ss.cust_name or 'customer')).strip().replace(' ', '_')
+            st.download_button(
+                '⬇ Download Impact Bundle (ZIP)', data=impact_bundle_zip,
+                file_name=f'{safe_name}_impact_bundle.zip', mime='application/zip',
+            )
+
+# ── Tab: Immigration ────────────────────────────────────────────────────────
+with tab_immigration:
+    if not ss.customer_id:
+        st.info('Select or create a customer to track immigration milestones.')
+    else:
+        st.subheader(f'Immigration — {ss.cust_name}')
+        st.caption('Track EB1A / NIW evidence milestones, target dates, and completion status for this customer.')
         st.caption('Category tags each milestone to an EB1A criterion or NIW prong for the progress charts below.')
+
+        with st.expander('Documents (Google Drive)', expanded=not (ss.petition_doc_url or ss.petition_folder_url)):
+            st.text_input('Petition Letter (Drive link)', key='petition_doc_url')
+            st.text_input('Supporting Exhibits Folder (Drive link)', key='petition_folder_url')
+            if st.button('Save Links', key='save_immigration_links'):
+                _do_save_customer_links(
+                    petition_doc_url=ss.petition_doc_url.strip(),
+                    petition_folder_url=ss.petition_folder_url.strip(),
+                )
+                st.rerun()
+            lcol1, lcol2 = st.columns(2)
+            with lcol1:
+                if ss.petition_doc_url:
+                    st.link_button('Open Petition Letter ↗', ss.petition_doc_url, use_container_width=True)
+            with lcol2:
+                if ss.petition_folder_url:
+                    st.link_button('Open Exhibits Folder ↗', ss.petition_folder_url, use_container_width=True)
 
         milestones_df = st.data_editor(
             ss.milestones_df,

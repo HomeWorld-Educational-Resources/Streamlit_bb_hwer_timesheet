@@ -55,6 +55,13 @@ def init_db():
             );
             CREATE UNIQUE INDEX IF NOT EXISTS customers_name_lower_idx
                 ON customers (LOWER(name));
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS career_target TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS resume_doc_url TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS resume_folder_url TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS cv_doc_url TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS cv_folder_url TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS petition_doc_url TEXT DEFAULT '';
+            ALTER TABLE customers ADD COLUMN IF NOT EXISTS petition_folder_url TEXT DEFAULT '';
 
             CREATE TABLE IF NOT EXISTS payments (
                 id           SERIAL PRIMARY KEY,
@@ -115,6 +122,32 @@ def init_db():
                 hours         REAL    DEFAULT 0,
                 description   TEXT    DEFAULT '',
                 created_at    TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS career_items (
+                id          SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                sort_order  INTEGER DEFAULT 0,
+                category    TEXT    DEFAULT '',
+                title       TEXT    NOT NULL,
+                target_date TEXT    DEFAULT '',
+                percent_complete REAL DEFAULT 0,
+                status      TEXT    DEFAULT 'Not Started',
+                notes       TEXT    DEFAULT '',
+                created_at  TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS impact_items (
+                id           SERIAL PRIMARY KEY,
+                customer_id  INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                sort_order   INTEGER DEFAULT 0,
+                category     TEXT    DEFAULT '',
+                title        TEXT    NOT NULL,
+                metric_value TEXT    DEFAULT '',
+                bb_supported BOOLEAN DEFAULT FALSE,
+                item_date    TEXT    DEFAULT '',
+                notes        TEXT    DEFAULT '',
+                created_at   TIMESTAMP DEFAULT NOW()
             );
         """)
 
@@ -376,3 +409,85 @@ def all_contractor_entries():
             ORDER BY ct.name, ce.entry_date, ce.id
         """)
         return [_row(r) for r in cur.fetchall()]
+
+
+# ── career items ─────────────────────────────────────────────────────────────
+
+def get_career_items(customer_id):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM career_items WHERE customer_id=%s ORDER BY sort_order, id",
+            (customer_id,)
+        )
+        return [_row(r) for r in cur.fetchall()]
+
+
+def replace_career_items(customer_id, items):
+    """items = list of {category, title, target_date, percent_complete, status, notes}."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM career_items WHERE customer_id=%s", (customer_id,))
+        for i, it in enumerate(items):
+            cur.execute("""
+                INSERT INTO career_items
+                    (customer_id, sort_order, category, title, target_date, percent_complete, status, notes)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (customer_id, i, it.get('category', ''), it.get('title', ''),
+                  it.get('target_date', ''), it.get('percent_complete', 0),
+                  it.get('status', 'Not Started'), it.get('notes', '')))
+
+
+# ── impact items ──────────────────────────────────────────────────────────────
+
+def get_impact_items(customer_id):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM impact_items WHERE customer_id=%s ORDER BY sort_order, id",
+            (customer_id,)
+        )
+        return [_row(r) for r in cur.fetchall()]
+
+
+def replace_impact_items(customer_id, items):
+    """items = list of {category, title, metric_value, bb_supported, item_date, notes}."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM impact_items WHERE customer_id=%s", (customer_id,))
+        for i, it in enumerate(items):
+            cur.execute("""
+                INSERT INTO impact_items
+                    (customer_id, sort_order, category, title, metric_value, bb_supported, item_date, notes)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (customer_id, i, it.get('category', ''), it.get('title', ''),
+                  it.get('metric_value', ''), bool(it.get('bb_supported', False)),
+                  it.get('item_date', ''), it.get('notes', '')))
+
+
+# ── customer document links ─────────────────────────────────────────────────
+
+def update_customer_links(customer_id, career_target=None, resume_doc_url=None,
+                          resume_folder_url=None, cv_doc_url=None, cv_folder_url=None,
+                          petition_doc_url=None, petition_folder_url=None):
+    """Updates only the document-link / career-target fields, leaving the rest of the
+    customer record untouched. Pass None for a field to leave it unchanged."""
+    fields = {
+        'career_target': career_target,
+        'resume_doc_url': resume_doc_url,
+        'resume_folder_url': resume_folder_url,
+        'cv_doc_url': cv_doc_url,
+        'cv_folder_url': cv_folder_url,
+        'petition_doc_url': petition_doc_url,
+        'petition_folder_url': petition_folder_url,
+    }
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return
+    with _db() as conn:
+        cur = conn.cursor()
+        set_clause = ', '.join(f'{k}=%s' for k in fields)
+        cur.execute(
+            f"UPDATE customers SET {set_clause} WHERE id=%s",
+            (*fields.values(), customer_id)
+        )
