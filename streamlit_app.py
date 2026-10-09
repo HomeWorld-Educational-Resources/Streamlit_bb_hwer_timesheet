@@ -16,7 +16,7 @@ LOGO_PATH = APP_DIR / 'logo.png'
 
 PAYMENT_DATE_FORMAT = '%b-%d-%Y'
 WEEK_DATE_FORMAT = '%Y-%m-%d'
-N_ACTIVITY_ROWS = 5
+N_ACTIVITY_ROWS = 5   # number of blank starter rows shown; the table can grow without limit
 MAX_PAYMENT_ROWS = 30
 MAX_MILESTONE_ROWS = 20
 MILESTONE_STATUSES = ['Not Started', 'In Progress', 'Complete', 'Blocked']
@@ -164,10 +164,11 @@ def _blank_contractor_entries():
     ])
 
 
-def _acts_from_db(customer_id):
-    rows = db.last_timesheet_activities(customer_id)
+def _acts_df_from_list(rows):
+    """Build the Activities editor dataframe from saved activity dicts (no row limit;
+    padded with blank starter rows up to N_ACTIVITY_ROWS)."""
     result = []
-    for a in rows[:N_ACTIVITY_ROWS]:
+    for a in rows:
         result.append({
             'Activity': a.get('activity', ''),
             'Mon': str(a.get('mon', '') or ''),
@@ -180,6 +181,34 @@ def _acts_from_db(customer_id):
     while len(result) < N_ACTIVITY_ROWS:
         result.append({'Activity': '', 'Mon': '', 'Tue': '', 'Wed': '', 'Thu': '', 'Fri': '', 'Output description': ''})
     return pd.DataFrame(result)
+
+
+def _acts_from_db(customer_id):
+    return _acts_df_from_list(db.last_timesheet_activities(customer_id))
+
+
+def _collect_activities(activities_df):
+    """Editor dataframe -> list of activity dicts, skipping completely empty rows."""
+    activities = []
+    for _, row in activities_df.iterrows():
+        a = {
+            'activity': str(row.get('Activity') or '').strip(),
+            'mon': _hours(row.get('Mon')),
+            'tue': _hours(row.get('Tue')),
+            'wed': _hours(row.get('Wed')),
+            'thu': _hours(row.get('Thu')),
+            'fri': _hours(row.get('Fri')),
+            'output_description': str(row.get('Output description') or '').strip(),
+        }
+        if not a['activity'] and not a['output_description'] and not any(
+                a[d] for d in ('mon', 'tue', 'wed', 'thu', 'fri')):
+            continue
+        activities.append(a)
+    return activities
+
+
+def _activities_total_hours(activities):
+    return sum(a['mon'] + a['tue'] + a['wed'] + a['thu'] + a['fri'] for a in activities)
 
 
 def _pmts_from_db(customer_id):
@@ -563,6 +592,114 @@ def _build_impact_bundle_zip(customer, items):
     )
 
 
+def _week_ctx_key():
+    ss = st.session_state
+    dt = _safe_parse_date(ss.week_start)
+    return (ss.customer_id, dt.strftime(WEEK_DATE_FORMAT) if dt else None)
+
+
+def _default_prior_balance(customer_id, week_start):
+    """Prior Balance default = Total Due of the last report generated for an earlier week.
+    Returns (value_as_str, explanatory_note)."""
+    ts = db.latest_timesheet_before(customer_id, week_start)
+    if not ts:
+        return '0', 'No earlier report for this customer — Prior Balance defaults to 0.'
+    hours = _activities_total_hours([
+        {k: _hours(a.get(k)) for k in ('mon', 'tue', 'wed', 'thu', 'fri')} for a in ts['activities']
+    ])
+    total_due = max(0.0, (ts.get('prior_balance') or 0.0) + hours * (ts.get('hourly_rate') or 0.0))
+    return f'{total_due:.2f}', (
+        f"Prior Balance defaulted from the report for the week of {ts['week_start']} "
+        f"(Total Due ${total_due:,.2f}). Edit it if needed."
+    )
+
+
+def _auto_week_number(customer_id, week_start):
+    """Remembered number if this week was already saved/generated, else week-of-month (1-4)."""
+    draft = db.get_weekly_draft(customer_id, week_start)
+    if draft and draft.get('week_number') in (1, 2, 3, 4):
+        return int(draft['week_number'])
+    ts = db.timesheet_for_week(customer_id, week_start)
+    if ts and ts.get('week_number') in (1, 2, 3, 4):
+        return int(ts['week_number'])
+    dt = _safe_parse_date(week_start)
+    return min(4, (dt.day - 1) // 7 + 1) if dt else 1
+
+
+def _load_week_context():
+    """Called whenever the selected customer or Week Start changes: restores the saved
+    draft for that week if there is one, otherwise applies the defaults (previous report's
+    balance as Prior Balance, automatic week number, last report's activities as a template)."""
+    ss = st.session_state
+    key = _week_ctx_key()
+    ss.week_ctx = key
+    cid, ws = key
+    if not cid or not ws:
+        ss.week_prior_note = ''
+        return
+    draft = db.get_weekly_draft(cid, ws)
+    if draft:
+        ss.week_number = int(draft['week_number']) if draft.get('week_number') in (1, 2, 3, 4) else 1
+        ss.week_rate = draft.get('rate_override') or ''
+        ss.week_prior_bal = draft.get('prior_balance') or '0'
+        ss.week_max_override = draft.get('max_override') or ''
+        ss.activities_df = _acts_df_from_list(draft['activities'])
+        ss.week_prior_note = f"Loaded your saved draft for the week of {ws} (last saved {draft.get('updated_at', '')})."
+    else:
+        ss.week_number = _auto_week_number(cid, ws)
+        ss.week_rate = ss.cust_rate
+        ss.week_max_override = ss.cust_max_spend
+        ss.week_prior_bal, ss.week_prior_note = _default_prior_balance(cid, ws)
+        ss.activities_df = _acts_from_db(cid)
+    ss.editor_v += 1
+
+
+def _build_worklist_csv(customer_name, week_start, week_number, activities):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['Customer', 'Week Start', 'Week Number', 'Activity', 'Mon', 'Tue', 'Wed',
+                'Thu', 'Fri', 'Total Hours', 'Output description'])
+    for a in activities:
+        total = a['mon'] + a['tue'] + a['wed'] + a['thu'] + a['fri']
+        w.writerow([customer_name, week_start, week_number, a['activity'],
+                    a['mon'] or '', a['tue'] or '', a['wed'] or '', a['thu'] or '', a['fri'] or '',
+                    total or '', a['output_description']])
+    return buf.getvalue().encode('utf-8-sig')  # BOM for Excel compat
+
+
+def _build_milestones_csv(customer_name, milestones):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['Customer', 'Category', 'Milestone', 'Target Date', '% Complete', 'Status', 'Notes'])
+    for m in milestones:
+        w.writerow([customer_name, m.get('category') or '', m.get('title') or '',
+                    m.get('target_date') or '', m.get('percent_complete', 0) or 0,
+                    m.get('status') or '', m.get('notes') or ''])
+    return buf.getvalue().encode('utf-8-sig')
+
+
+def _build_career_csv(customer_name, items):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['Customer', 'Category', 'Item', 'Target Date', '% Complete', 'Status', 'Notes'])
+    for it in items:
+        w.writerow([customer_name, it.get('category') or '', it.get('title') or '',
+                    it.get('target_date') or '', it.get('percent_complete', 0) or 0,
+                    it.get('status') or '', it.get('notes') or ''])
+    return buf.getvalue().encode('utf-8-sig')
+
+
+def _build_impact_csv(customer_name, items):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['Customer', 'Category', 'Item', 'Metric/Value', 'BB Supported', 'Date', 'Notes'])
+    for it in items:
+        w.writerow([customer_name, it.get('category') or '', it.get('title') or '',
+                    it.get('metric_value') or '', 'Yes' if it.get('bb_supported') else 'No',
+                    it.get('item_date') or '', it.get('notes') or ''])
+    return buf.getvalue().encode('utf-8-sig')
+
+
 def _select_customer(cust):
     ss = st.session_state
     ss.customer_id = cust['id']
@@ -680,6 +817,8 @@ def _init():
     ss.cust_contract_note = ''
     ss.cust_footnote = ''
     # week form widget keys
+    ss.week_ctx = None
+    ss.week_prior_note = ''
     ss.week_start = _current_week_monday()
     ss.week_number = 1
     ss.week_rate = ''
@@ -721,6 +860,7 @@ def _do_save_customer():
         ss.cust_footnote.strip(),
     )
     ss.customer_id = cid
+    ss.week_ctx = _week_ctx_key()   # keep what's on screen; nothing to reload for a just-saved customer
     ss.status = f'Customer "{name}" saved.'
     ss.status_type = 'success'
     return True
@@ -913,6 +1053,30 @@ def _do_save_contractor_entries(entries_df, customer_name_to_id):
     ss.status_type = 'success'
 
 
+def _do_save_week(activities_df):
+    """Save the week in progress (no PDF/CSV, no report record) so it can be continued later."""
+    ss = st.session_state
+    if not ss.customer_id:
+        ss.status = 'Error: Save customer first.'
+        ss.status_type = 'error'
+        return
+    week_dt = _safe_parse_date(ss.week_start)
+    if week_dt is None:
+        ss.status = 'Error: Week start must be a valid date (YYYY-MM-DD).'
+        ss.status_type = 'error'
+        return
+    activities = _collect_activities(activities_df)
+    week_start = week_dt.strftime(WEEK_DATE_FORMAT)
+    db.save_weekly_draft(
+        ss.customer_id, week_start, int(ss.week_number),
+        ss.week_rate.strip(), ss.week_prior_bal.strip(), ss.week_max_override.strip(), activities,
+    )
+    ss.activities_df = _acts_df_from_list(activities)
+    ss.editor_v += 1
+    ss.status = f'Saved week of {week_start}: {len(activities)} activit{"y" if len(activities) == 1 else "ies"}.'
+    ss.status_type = 'success'
+
+
 def _do_generate(activities_df):
     ss = st.session_state
     if not ss.customer_id:
@@ -937,17 +1101,7 @@ def _do_generate(activities_df):
     max_spend = _sf(ss.week_max_override) if ss.week_max_override.strip() else _sf(ss.cust_max_spend)
     week_num = ss.week_number
 
-    activities = []
-    for _, row in activities_df.iterrows():
-        activities.append({
-            'activity': str(row.get('Activity') or ''),
-            'mon': _hours(row.get('Mon')),
-            'tue': _hours(row.get('Tue')),
-            'wed': _hours(row.get('Wed')),
-            'thu': _hours(row.get('Thu')),
-            'fri': _hours(row.get('Fri')),
-            'output_description': str(row.get('Output description') or ''),
-        })
+    activities = _collect_activities(activities_df)
 
     payments = db.get_payments(ss.customer_id)
     payments_snapshot = [
@@ -986,6 +1140,12 @@ def _do_generate(activities_df):
         activities=activities,
         payments_snapshot=payments_snapshot,
         file_name=file_name,
+    )
+
+    # also keep the week as a saved draft so it reloads exactly as generated
+    db.save_weekly_draft(
+        ss.customer_id, week_dt.strftime(WEEK_DATE_FORMAT), int(week_num),
+        ss.week_rate.strip(), ss.week_prior_bal.strip(), ss.week_max_override.strip(), activities,
     )
 
     # PDF
@@ -1086,6 +1246,10 @@ with st.sidebar:
         st.rerun()
 
 
+# ── Week context sync (must run before the Week Setup widgets are created) ────
+if ss.week_ctx != _week_ctx_key():
+    _load_week_context()
+
 # ── Main: tabs ────────────────────────────────────────────────────────────────
 tab_sheet, tab_payments, tab_career, tab_impact, tab_immigration, tab_contractors, tab_history = st.tabs(
     ['New Timesheet', 'Payments', 'Career', 'Impact', 'Immigration', 'Contractors', 'History']
@@ -1107,15 +1271,19 @@ with tab_sheet:
     with wc5:
         st.text_input('Max Contract Override ($)', key='week_max_override',
                       help='Leave blank to use customer default')
+    if ss.week_prior_note:
+        st.caption(ss.week_prior_note)
 
     st.divider()
     st.subheader('Activities')
+    st.caption('Add as many rows as you need (use the + at the bottom of the table). '
+               'Click Save to keep the week as a draft and continue later; Generate builds the CSV + PDF.')
 
     activities_df = st.data_editor(
         ss.activities_df,
         use_container_width=True,
         hide_index=True,
-        num_rows='fixed',
+        num_rows='dynamic',
         column_config={
             'Activity': st.column_config.TextColumn('Activity', width='large'),
             'Mon': st.column_config.TextColumn('Mon', width='small'),
@@ -1129,11 +1297,27 @@ with tab_sheet:
     )
 
     st.divider()
-    gc1, gc2, gc3 = st.columns([2, 2, 3])
+    gs, gc1, gc2, gc3 = st.columns([1.5, 2, 1.5, 2.5])
+    with gs:
+        if st.button('💾 Save', use_container_width=True,
+                     help='Save this week as a draft without generating a report'):
+            _do_save_week(activities_df)
+            st.rerun()
     with gc1:
         if st.button('Generate CSV + PDF', type='primary', use_container_width=True):
             _do_generate(activities_df)
             st.rerun()
+
+    _wl_dt = _safe_parse_date(ss.week_start)
+    _wl_acts = _collect_activities(activities_df)
+    st.download_button(
+        '⬇ Weekly Work List (CSV)',
+        data=_build_worklist_csv(ss.cust_name, _wl_dt.strftime(WEEK_DATE_FORMAT) if _wl_dt else ss.week_start,
+                                 ss.week_number, _wl_acts),
+        file_name=f'{ss.cust_name or "Customer"} - {ss.week_start} Week {ss.week_number} work list.csv',
+        mime='text/csv',
+        help='The activities currently in the table above, as a plain CSV (works before Save/Generate).',
+    )
 
     if ss.generated_bytes and ss.generated_name:
         with gc2:
@@ -1234,6 +1418,12 @@ with tab_career:
         if not active_career:
             st.info('No career items saved yet — add rows above and click Save Career Items.')
         else:
+            st.download_button(
+                '⬇ Career Items (CSV)',
+                data=_build_career_csv(ss.cust_name, active_career),
+                file_name=f'{ss.cust_name or "Customer"} - career items.csv',
+                mime='text/csv',
+            )
             overall = sum(it.get('percent_complete', 0) or 0 for it in active_career) / len(active_career)
             st.metric('Overall Progress', f'{overall:.0f}%')
 
@@ -1364,6 +1554,12 @@ with tab_impact:
         if not active_impact:
             st.info('No impact items saved yet — add rows above and click Save Impact Items.')
         else:
+            st.download_button(
+                '⬇ Impact Items (CSV)',
+                data=_build_impact_csv(ss.cust_name, active_impact),
+                file_name=f'{ss.cust_name or "Customer"} - impact items.csv',
+                mime='text/csv',
+            )
             bb_count = sum(1 for it in active_impact if it.get('bb_supported'))
             ic1, ic2 = st.columns(2)
             ic1.metric('Total Achievements', len(active_impact))
@@ -1485,6 +1681,12 @@ with tab_immigration:
         if not active:
             st.info('No milestones saved yet — add rows above and click Save Milestones.')
         else:
+            st.download_button(
+                '⬇ Milestones (CSV)',
+                data=_build_milestones_csv(ss.cust_name, active),
+                file_name=f'{ss.cust_name or "Customer"} - milestones.csv',
+                mime='text/csv',
+            )
             overall = sum(m.get('percent_complete', 0) or 0 for m in active) / len(active)
             done = sum(1 for m in active if (m.get('status') or '') == 'Complete')
 

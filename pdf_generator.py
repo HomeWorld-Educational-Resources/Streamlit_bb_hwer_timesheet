@@ -90,6 +90,30 @@ class _Draw:
         table.drawOn(self.c, x, self.y - h)
         self.y -= h
 
+    def place_table_paginated(self, table, x=ML, bottom=MB + 40):
+        """Place a table, splitting it across pages (header row repeats) if it is too tall."""
+        while True:
+            avail_h = self.y - bottom
+            _, h = table.wrapOn(self.c, CW, PAGE_H)
+            if h <= avail_h:
+                table.drawOn(self.c, x, self.y - h)
+                self.y -= h
+                return
+            parts = table.split(CW, avail_h)
+            if len(parts) < 2:
+                if self.y >= PAGE_H - 40:      # already on a fresh page; draw as-is
+                    table.drawOn(self.c, x, self.y - h)
+                    self.y -= h
+                    return
+                self.new_page()
+                continue
+            first, rest = parts[0], parts[1]
+            _, fh = first.wrapOn(self.c, CW, PAGE_H)
+            first.drawOn(self.c, x, self.y - fh)
+            self.y -= fh
+            self.new_page()
+            table = rest
+
     def section_label(self, label, pad_above=14, pad_below=6):
         self.y -= pad_above
         self.text(ML, label, font='Helvetica-Bold', size=8, color=GOLD)
@@ -422,7 +446,7 @@ def generate_pdf(customer_name, company, week_dt, week_number,
     # ── activities ────────────────────────────────────────────────────────────
     d.section_label('Activities')
     act_table, total_hours = _act_table(activities)
-    d.place_table(act_table)
+    d.place_table_paginated(act_table)
 
     # ── week summary ──────────────────────────────────────────────────────────
     amount_week = total_hours * rate
@@ -430,6 +454,8 @@ def generate_pdf(customer_name, company, week_dt, week_number,
     # not subtracted again here — doing so would double-count payments.
     total_due = max(0.0, prior_bal + amount_week)
 
+    if d.y - 110 < MB + 40:   # not enough room for the summary boxes + footer
+        d.new_page()
     d.section_label('Week Summary', pad_above=16)
     _summary_boxes(d, [
         ('Total Hours',     f'{total_hours:g} hrs'),

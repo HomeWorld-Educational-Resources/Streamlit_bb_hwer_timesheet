@@ -124,6 +124,19 @@ def init_db():
                 created_at    TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS weekly_drafts (
+                id            SERIAL PRIMARY KEY,
+                customer_id   INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                week_start    TEXT    NOT NULL,
+                week_number   INTEGER DEFAULT 1,
+                rate_override TEXT    DEFAULT '',
+                prior_balance TEXT    DEFAULT '',
+                max_override  TEXT    DEFAULT '',
+                activities_json TEXT  DEFAULT '[]',
+                updated_at    TIMESTAMP DEFAULT NOW(),
+                UNIQUE (customer_id, week_start)
+            );
+
             CREATE TABLE IF NOT EXISTS career_items (
                 id          SERIAL PRIMARY KEY,
                 customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -491,3 +504,74 @@ def update_customer_links(customer_id, career_target=None, resume_doc_url=None,
             f"UPDATE customers SET {set_clause} WHERE id=%s",
             (*fields.values(), customer_id)
         )
+
+
+
+# ── weekly drafts (Save without Generate) ───────────────────────────────────
+
+def save_weekly_draft(customer_id, week_start, week_number, rate_override,
+                      prior_balance, max_override, activities):
+    """Upsert the in-progress week for (customer, week_start)."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO weekly_drafts
+                (customer_id, week_start, week_number, rate_override,
+                 prior_balance, max_override, activities_json)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (customer_id, week_start) DO UPDATE SET
+                week_number=EXCLUDED.week_number,
+                rate_override=EXCLUDED.rate_override,
+                prior_balance=EXCLUDED.prior_balance,
+                max_override=EXCLUDED.max_override,
+                activities_json=EXCLUDED.activities_json,
+                updated_at=NOW()
+        """, (customer_id, week_start, week_number, rate_override,
+              prior_balance, max_override, json.dumps(activities)))
+
+
+def get_weekly_draft(customer_id, week_start):
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM weekly_drafts WHERE customer_id=%s AND week_start=%s",
+            (customer_id, week_start)
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        d = _row(r)
+        d['activities'] = json.loads(d.pop('activities_json', '[]') or '[]')
+        return d
+
+
+def latest_timesheet_before(customer_id, week_start):
+    """Most recently generated report for an EARLIER week than week_start
+    (used to default Prior Balance). Returns None if there is none."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM timesheets
+            WHERE customer_id=%s AND week_start < %s
+            ORDER BY week_start DESC, created_at DESC, id DESC LIMIT 1
+        """, (customer_id, week_start))
+        r = cur.fetchone()
+        if not r:
+            return None
+        d = _row(r)
+        d['activities'] = json.loads(d.pop('activities_json', '[]') or '[]')
+        d['payments_snapshot'] = json.loads(d.pop('payments_snapshot_json', '[]') or '[]')
+        return d
+
+
+def timesheet_for_week(customer_id, week_start):
+    """Most recently generated report for exactly this week (or None)."""
+    with _db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, week_number FROM timesheets
+            WHERE customer_id=%s AND week_start=%s
+            ORDER BY created_at DESC, id DESC LIMIT 1
+        """, (customer_id, week_start))
+        r = cur.fetchone()
+        return _row(r) if r else None
