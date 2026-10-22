@@ -1246,6 +1246,15 @@ with st.sidebar:
         st.rerun()
 
 
+# ── Keep widget-backed keys alive ─────────────────────────────────────────────
+# The Career / Impact / Immigration link fields only render when a customer is selected.
+# On any run where they are not rendered (e.g. after "+ New Customer"), Streamlit drops their
+# session state, so recreate them here before any tab reads them.
+for _k in ('career_target', 'resume_doc_url', 'resume_folder_url',
+           'cv_doc_url', 'cv_folder_url', 'petition_doc_url', 'petition_folder_url'):
+    if _k not in ss:
+        ss[_k] = ''
+
 # ── Week context sync (must run before the Week Setup widgets are created) ────
 if ss.week_ctx != _week_ctx_key():
     _load_week_context()
